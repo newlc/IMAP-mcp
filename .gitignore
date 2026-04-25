@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Config with real credentials
+config.json
+
+# Auto-archive sender list (user-specific)
+auto_archive_senders.json
+
+# Cache database (may contain sensitive emails)
+*.db
+*.db.enc
+*.db.enc.tmp
+
+# pytest
+.pytest_cache/
+
+# IDE
+.vscode/
+.cursor/
+.idea/
+
+# macOS
+.DS_Store

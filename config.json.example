@@ -1,0 +1,43 @@
+{
+  "imap": {
+    "host": "imap.example.com",
+    "port": 993,
+    "secure": true
+  },
+  "smtp": {
+    "host": "smtp.example.com",
+    "port": 587
+  },
+  "credentials": {
+    "username": "your-email@example.com",
+    "password": ""
+  },
+  "_comment": "Leave password empty and run 'imap-mcp --set-password' to store it securely in the OS keyring (macOS Keychain / Windows Credential Locker / Linux SecretService)",
+  "user": {
+    "name": "Your Name",
+    "email": "your-email@example.com",
+    "signature": {
+      "enabled": true,
+      "text": "\n\n--\nBest regards,\nYour Name\nTel: +1 555 123 4567\nEmail: your-email@example.com",
+      "html": "<br><br><div style=\"color: #666; font-size: 12px;\">--<br>Best regards,<br><strong>Your Name</strong><br>Tel: +1 555 123 4567<br>Email: your-email@example.com</div>"
+    }
+  },
+  "folders": {
+    "inbox": "INBOX",
+    "next": "Next",
+    "waiting": "Waiting",
+    "someday": "Someday",
+    "archive": "Archive",
+    "drafts": "Drafts"
+  },
+  "cache": {
+    "enabled": true,
+    "ttl_seconds": 300,
+    "db_path": "~/.imap-mcp/cache.db",
+    "encrypt": false
+  },
+  "auto_archive": {
+    "enabled": true,
+    "senders_file": "auto_archive_senders.json"
+  }
+}

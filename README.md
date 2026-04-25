@@ -1,0 +1,450 @@
+# IMAP-MCP
+
+MCP server for IMAP email operations with persistent encrypted cache. Designed for AI assistants (Claude Code, Claude Desktop) to read, search, organize, and draft emails on your behalf.
+
+## Why IMAP-MCP?
+
+Most email MCP servers rely on AppleScript or native mail client APIs, which choke on large mailboxes (100K+ emails) and require the mail app to be running. IMAP-MCP talks directly to the IMAP server and caches everything locally in SQLite, so you can:
+
+- **Work with massive mailboxes (300K+ emails)** without timeouts or memory issues -- the cache handles pagination and incremental loading
+- **Analyze email offline** -- once cached, all queries run against the local database with zero server load, making it fast even on slow or metered connections
+- **Feed email data to other tools** -- use cached emails as context for AI assistants to create tasks from action items, track unanswered emails, summarize threads, generate follow-up drafts, extract contacts, or build dashboards
+- **Process email at scale** -- sort thousands of emails into folders, bulk-archive by sender, detect patterns across months of correspondence -- all without hammering your IMAP server
+
+The local cache turns your mailbox into a queryable database that AI assistants can explore freely without worrying about rate limits, connection timeouts, or server availability.
+
+## Features
+
+- **Full IMAP access** -- read, search, move, copy, flag, archive, and draft emails
+- **Persistent SQLite cache** with optional AES encryption (Fernet) -- emails and attachments stored locally for fast offline access
+- **Cross-platform secure credential storage** via OS keyring (macOS Keychain / Windows Credential Locker / Linux SecretService)
+- **Flexible cache loading** -- recent N emails, new-only, older (paginate backwards), or date range
+- **Cache-first reads** -- subsequent queries served from local cache without hitting the IMAP server
+- **IMAP IDLE watching** for real-time notifications across multiple mailboxes
+- **Auto-archive** -- automatically archive emails from configured sender patterns
+- **Draft composition** with configurable signature (text and HTML)
+- **Standalone inbox sorting script** (`sort_inbox.py`) for rule-based email organization
+
+## Security
+
+### Credentials
+
+All sensitive credentials are stored in the **OS keyring** -- the native secure storage on each platform:
+
+| Platform | Backend |
+|----------|---------|
+| macOS | Keychain (protected by Touch ID / login password) |
+| Windows | Windows Credential Locker |
+| Linux | SecretService (GNOME Keyring / KDE Wallet) |
+
+The `credentials.password` field in `config.json` should be left **empty**. Passwords are saved to the keyring via `imap-mcp --set-password` and retrieved automatically at runtime. No plaintext passwords are ever written to disk.
+
+### Encrypted cache
+
+When `cache.encrypt: true`, the local SQLite database containing your emails, bodies, and attachments is **AES-encrypted** (Fernet / AES-128-CBC + HMAC-SHA256):
+
+- The database lives **entirely in memory** while the server runs
+- On disk, only an encrypted snapshot exists (`.db.enc`) -- it is unreadable without the key
+- The encryption key is auto-generated on first use and stored in the OS keyring under the service `imap-mcp-cache`
+- **If someone copies the `.db.enc` file to another machine, they cannot decrypt it** -- the key only exists in the keyring of the original machine
+- The encrypted file is updated atomically (temp file + rename) to prevent corruption
+- Auto-flush every 50 write operations + forced flush after bulk operations (`load_cache`, `sync_emails`)
+
+When `cache.encrypt: false`, a plain SQLite file is written to disk with WAL journaling. This is recommended for very large mailboxes (100K+ emails) where holding the entire database in memory would consume too much RAM.
+
+### Other protections
+
+- **UIDVALIDITY tracking**: if the IMAP server reassigns UIDs (mailbox recreation), the cache for that mailbox is automatically purged and rebuilt
+- **Namespace auto-detection**: the server automatically handles IMAP servers that require `INBOX.` prefix for folder names (e.g., Dovecot, Jino)
+
+## Installation
+
+### As an MCP server for Claude Code
+
+```bash
+# Install from local checkout
+pipx install /path/to/IMAP-MCP
+
+# Or install from GitHub
+pipx install git+https://github.com/newlc/IMAP-mcp.git
+
+# Store your IMAP password securely in the OS keyring
+# (this will verify the connection before saving)
+imap-mcp --set-password --config /path/to/config.json
+
+# Add to Claude Code (project-level, current project only)
+claude mcp add imap-mcp /path/to/imap-mcp -- --config /path/to/config.json
+
+# Add to Claude Code (global, available in all projects)
+claude mcp add --scope user imap-mcp /path/to/imap-mcp -- --config /path/to/config.json
+```
+
+### For Claude Desktop
+
+Add the following to your `claude_desktop_config.json` (typically at `~/Library/Application Support/Claude/claude_desktop_config.json` on macOS):
+
+```json
+{
+  "mcpServers": {
+    "imap-mcp": {
+      "command": "imap-mcp",
+      "args": ["--config", "/path/to/config.json"]
+    }
+  }
+}
+```
+
+If you installed with `pipx`, use the full path to the binary:
+
+```json
+{
+  "mcpServers": {
+    "imap-mcp": {
+      "command": "/Users/yourname/.local/bin/imap-mcp",
+      "args": ["--config", "/path/to/config.json"]
+    }
+  }
+}
+```
+
+### For VS Code (Copilot / Cline / Continue)
+
+Add to your `.vscode/mcp.json` (or create it):
+
+```json
+{
+  "servers": {
+    "imap-mcp": {
+      "command": "imap-mcp",
+      "args": ["--config", "/path/to/config.json"]
+    }
+  }
+}
+```
+
+If installed via `pipx`, use the full path:
+
+```json
+{
+  "servers": {
+    "imap-mcp": {
+      "command": "/Users/yourname/.local/bin/imap-mcp",
+      "args": ["--config", "/path/to/config.json"]
+    }
+  }
+}
+```
+
+### For Cursor
+
+Add to your `.cursor/mcp.json` in the project root (or `~/.cursor/mcp.json` for global):
+
+```json
+{
+  "mcpServers": {
+    "imap-mcp": {
+      "command": "imap-mcp",
+      "args": ["--config", "/path/to/config.json"]
+    }
+  }
+}
+```
+
+With `pipx`:
+
+```json
+{
+  "mcpServers": {
+    "imap-mcp": {
+      "command": "/Users/yourname/.local/bin/imap-mcp",
+      "args": ["--config", "/path/to/config.json"]
+    }
+  }
+}
+```
+
+### For Windsurf
+
+Add to `~/.codeium/windsurf/mcp_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "imap-mcp": {
+      "command": "imap-mcp",
+      "args": ["--config", "/path/to/config.json"]
+    }
+  }
+}
+```
+
+### CLAUDE.md / .cursorrules / AGENTS.md integration
+
+Add a snippet to your project instructions file so the AI assistant knows how to use the email server:
+
+```markdown
+## Email
+
+Use the `imap-mcp` MCP server to access email. Workflow:
+
+1. Call `auto_connect` first (reads config.json and credentials from keyring).
+2. Use `load_cache` with mode "recent" to populate the local cache.
+3. Use `fetch_emails`, `search_emails`, `get_email` etc. to read emails.
+   These will be served from cache when possible.
+4. Use `move_email`, `archive_email`, `flag_email` to organize.
+5. Use `save_draft` to compose replies (drafts appear in the mail client for review before sending).
+6. Use `process_auto_archive` with `dry_run: true` to preview, then without to archive.
+```
+
+## Configuration
+
+Copy `config.json.example` to `config.json` and edit:
+
+```jsonc
+{
+  // IMAP server connection
+  "imap": {
+    "host": "imap.example.com",     // IMAP server hostname
+    "port": 993,                     // IMAP port (993 = SSL/TLS)
+    "secure": true                   // Use SSL/TLS
+  },
+
+  // SMTP server (used for saving drafts with proper headers)
+  "smtp": {
+    "host": "smtp.example.com",
+    "port": 587
+  },
+
+  // Credentials -- leave password EMPTY and use --set-password
+  "credentials": {
+    "username": "your-email@example.com",
+    "password": ""
+  },
+
+  // User identity (used in From header and signature for drafts)
+  "user": {
+    "name": "Your Name",
+    "email": "your-email@example.com",
+    "signature": {
+      "enabled": true,
+      "text": "\n\n--\nYour Name\nTel: +1 234 567890",
+      "html": "<br><br><div style=\"color:#666\">--<br><b>Your Name</b><br>Tel: +1 234 567890</div>"
+    }
+  },
+
+  // Mailbox folder names (adjust to match your IMAP server)
+  "folders": {
+    "inbox": "INBOX",
+    "next": "Next",                  // GTD-style action folders
+    "waiting": "Waiting",
+    "someday": "Someday",
+    "archive": "Archive",
+    "drafts": "Drafts"
+  },
+
+  // In-memory cache for the IDLE watcher
+  "cache": {
+    "enabled": true,                 // Auto-start IDLE watcher on connect
+    "ttl_seconds": 300               // Cache TTL for overview queries
+  },
+
+  // Persistent SQLite cache (add these fields to enable)
+  // "cache": {
+  //   "db_path": "~/.imap-mcp/cache.db",  // Path to SQLite database
+  //   "encrypt": true                      // true = in-memory DB + encrypted file on disk
+  //                                        // false = plain SQLite file (better for 100K+ emails)
+  // },
+
+  // Auto-archive configuration
+  "auto_archive": {
+    "enabled": true,
+    "senders_file": "auto_archive_senders.json"  // JSON file with sender patterns
+  }
+}
+```
+
+### Storing your password
+
+```bash
+imap-mcp --set-password --config /path/to/config.json
+```
+
+This will:
+1. Read the username from `config.json`
+2. Prompt for the password
+3. Test the IMAP connection
+4. Store the password in the OS keyring on success
+
+To remove a stored password:
+
+```bash
+imap-mcp --delete-password --config /path/to/config.json
+```
+
+## Multiple accounts
+
+Each email account requires its own `config.json` and its own MCP server instance. Example with two accounts:
+
+```bash
+# Store passwords
+imap-mcp --set-password --config ~/mail/work-config.json
+imap-mcp --set-password --config ~/mail/personal-config.json
+
+# Add both to Claude Code
+claude mcp add imap-work   /path/to/imap-mcp -- --config ~/mail/work-config.json
+claude mcp add imap-personal /path/to/imap-mcp -- --config ~/mail/personal-config.json
+```
+
+Claude will see both as separate MCP servers and can access either account by name.
+
+## Cache modes (`load_cache` tool)
+
+The `load_cache` tool downloads emails (with bodies and attachments) into the local SQLite cache for offline access. It supports four modes:
+
+| Mode | Description | Key parameters |
+|------|-------------|----------------|
+| `recent` | Load the last N emails (newest first) | `count` (default: 100) |
+| `new` | Only emails newer than the most recent cached email | -- |
+| `older` | Go further back in time: N emails older than the oldest cached | `count` (default: 100) |
+| `range` | Emails within a specific date range | `since`, `before` (ISO dates) |
+
+All modes are **incremental** -- emails already in the cache are skipped.
+
+### Examples
+
+```
+# Load the 200 most recent emails
+load_cache(mailbox="INBOX", mode="recent", count=200)
+
+# Check for new emails since last cache load
+load_cache(mailbox="INBOX", mode="new")
+
+# Go further back: load 100 older emails
+load_cache(mailbox="INBOX", mode="older", count=100)
+
+# Load emails from January 2026
+load_cache(mailbox="INBOX", mode="range", since="2026-01-01", before="2026-02-01")
+```
+
+Use `get_cache_stats` to see how many emails are cached, database size, and encryption status.
+
+## Inbox sorting (`sort_inbox.py`)
+
+The standalone script `sort_inbox.py` sorts INBOX emails into subfolders based on sender domain patterns. It uses the same `config.json` and keyring credentials as the MCP server.
+
+```bash
+python sort_inbox.py /path/to/config.json
+```
+
+Rules are defined as `(folder, [patterns])` tuples at the top of the script. For example:
+
+- `@github.com` emails go to `INBOX.Dev`
+- `@linkedin.com` emails go to `INBOX.LinkedIn`
+- `@amazon.com` emails go to `INBOX.Shopping`
+
+Emails are moved in batches of 50 with a short pause between batches to avoid overloading the IMAP server. Edit the `RULES` list in the script to customize.
+
+## Available tools
+
+### Connection (4 tools)
+
+| Tool | Description |
+|------|-------------|
+| `auto_connect` | Connect using config.json + keyring credentials (recommended) |
+| `connect` | Manual IMAP connection to a host |
+| `authenticate` | Manual login with username/password |
+| `disconnect` | Close connection and stop watchers |
+
+### Mailbox management (4 tools)
+
+| Tool | Description |
+|------|-------------|
+| `list_mailboxes` | List all mailbox folders |
+| `select_mailbox` | Open a mailbox folder |
+| `create_mailbox` | Create a new folder |
+| `get_mailbox_status` | Get message count, unseen, UIDNEXT, etc. |
+
+### Email reading (7 tools)
+
+| Tool | Description |
+|------|-------------|
+| `fetch_emails` | Fetch emails with limit/offset, date filters |
+| `get_email` | Get complete email (headers + body + attachments) by UID |
+| `get_email_headers` | Get headers only (faster) |
+| `get_email_body` | Get body as text or HTML |
+| `get_attachments` | List attachment metadata |
+| `download_attachment` | Download attachment content (base64) |
+| `get_thread` | Get email conversation thread |
+
+### Search (6 tools)
+
+| Tool | Description |
+|------|-------------|
+| `search_emails` | Free-text or IMAP SEARCH syntax |
+| `search_by_sender` | Search by sender address |
+| `search_by_subject` | Search by subject text |
+| `search_by_date` | Search by date range |
+| `search_unread` | Get all unread emails |
+| `search_flagged` | Get all flagged/starred emails |
+
+### Actions (8 tools)
+
+| Tool | Description |
+|------|-------------|
+| `mark_read` | Mark emails as read |
+| `mark_unread` | Mark emails as unread |
+| `flag_email` | Add a flag (e.g. `\Flagged`, `\Important`) |
+| `unflag_email` | Remove a flag |
+| `move_email` | Move emails to another folder |
+| `copy_email` | Copy emails to another folder |
+| `archive_email` | Move emails to Archive folder |
+| `save_draft` | Save a draft with optional signature |
+
+### Statistics (2 tools)
+
+| Tool | Description |
+|------|-------------|
+| `get_unread_count` | Unread email count |
+| `get_total_count` | Total email count in mailbox |
+
+### Cache and watch (5 tools)
+
+| Tool | Description |
+|------|-------------|
+| `get_cached_overview` | Get in-memory overview of inbox/next/waiting/someday |
+| `refresh_cache` | Force refresh the in-memory cache |
+| `start_watch` | Start IDLE watchers on all configured folders |
+| `stop_watch` | Stop all IDLE watchers |
+| `idle_watch` | Watch a single mailbox temporarily (with timeout) |
+
+### Persistent cache (3 tools)
+
+| Tool | Description |
+|------|-------------|
+| `sync_emails` | Download emails for a date range into SQLite (incremental) |
+| `load_cache` | Flexible cache loader (recent/new/older/range modes) |
+| `get_cache_stats` | Cache statistics (count, size, encryption status) |
+
+### Auto-archive (5 tools)
+
+| Tool | Description |
+|------|-------------|
+| `get_auto_archive_list` | List auto-archive sender patterns |
+| `add_auto_archive_sender` | Add a sender/domain to auto-archive |
+| `remove_auto_archive_sender` | Remove a sender from auto-archive |
+| `reload_auto_archive` | Reload sender list from file |
+| `process_auto_archive` | Archive matching emails (supports dry_run) |
+
+## Requirements
+
+- Python 3.10+
+- Dependencies (installed automatically):
+  - `imapclient` >= 3.0.0 -- IMAP protocol client
+  - `mcp` >= 1.0.0 -- Model Context Protocol SDK
+  - `pydantic` >= 2.0.0 -- data validation
+  - `keyring` >= 25.0.0 -- OS keyring integration
+  - `cryptography` >= 43.0.0 -- AES encryption for cache
+
+## License
+
+MIT
