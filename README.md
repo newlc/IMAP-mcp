@@ -23,7 +23,7 @@ The local cache turns your mailbox into a queryable database that AI assistants 
 - **IMAP IDLE watching** for real-time notifications across multiple mailboxes
 - **Auto-archive** -- automatically archive emails from configured sender patterns
 - **Draft composition** with configurable signature (text and HTML)
-- **Standalone inbox sorting script** (`sort_inbox.py`) for rule-based email organization
+- **Bulk email sorting** via MCP tools -- move thousands of emails into folders by sender patterns
 
 ## Security
 
@@ -327,22 +327,6 @@ load_cache(mailbox="INBOX", mode="range", since="2026-01-01", before="2026-02-01
 ```
 
 Use `get_cache_stats` to see how many emails are cached, database size, and encryption status.
-
-## Inbox sorting (`sort_inbox.py`)
-
-The standalone script `sort_inbox.py` sorts INBOX emails into subfolders based on sender domain patterns. It uses the same `config.json` and keyring credentials as the MCP server.
-
-```bash
-python sort_inbox.py /path/to/config.json
-```
-
-Rules are defined as `(folder, [patterns])` tuples at the top of the script. For example:
-
-- `@github.com` emails go to `INBOX.Dev`
-- `@linkedin.com` emails go to `INBOX.LinkedIn`
-- `@amazon.com` emails go to `INBOX.Shopping`
-
-Emails are moved in batches of 50 with a short pause between batches to avoid overloading the IMAP server. Edit the `RULES` list in the script to customize.
 
 ## Available tools
 
