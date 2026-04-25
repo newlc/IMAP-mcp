@@ -1,5 +1,10 @@
 # IMAP-MCP
 
+[![CI](https://github.com/newlc/IMAP-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/newlc/IMAP-mcp/actions/workflows/ci.yml)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![MCP](https://img.shields.io/badge/MCP-compatible-purple.svg)](https://modelcontextprotocol.io)
+
 MCP server for IMAP email operations with persistent encrypted cache. Designed for AI assistants (Claude Code, Claude Desktop) to read, search, organize, and draft emails on your behalf.
 
 ## Why IMAP-MCP?
