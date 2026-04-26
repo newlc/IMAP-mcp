@@ -20,16 +20,64 @@ The local cache turns your mailbox into a queryable database that AI assistants 
 
 ## Features
 
-- **Full IMAP access** -- read, search, move, copy, flag, archive, and draft emails
-- **Read-only by default, opt-in `--write` mode** for sending, replying, forwarding, and deleting (see [Read-only vs write mode](#read-only-vs-write-mode))
-- **Persistent SQLite cache** with optional AES encryption (Fernet) -- emails and attachments stored locally for fast offline access
+- **Full IMAP access** -- read, search, move, copy, flag, archive, draft, send, reply, forward, and delete emails
+- **Multi-account in one server** -- every account has its own independent (optionally encrypted) cache; tools take an `account` parameter
+- **Read-only by default, opt-in `--write` mode** for sending, replying, forwarding, deleting, mailbox rename/delete/empty, and Sieve script management (see [Read-only vs write mode](#read-only-vs-write-mode))
+- **Folder management** -- create, rename, delete, empty, subscribe, unsubscribe
+- **Drafts** -- save, update, delete (with file attachments)
+- **Server-side rules via ManageSieve** (RFC 5804) -- list, get, check, put, delete, activate Sieve scripts
+- **Spam handling** -- `report_spam`/`mark_not_spam` (move + `$Junk`/`$NotJunk` keywords for filter training)
+- **Real threading** -- IMAP `THREAD REFERENCES` with cached `Message-ID`/`References` fallback
+- **Full-text search** -- SQLite FTS5 index over cached subjects, bodies, and addresses; combined IMAP `SEARCH` with multiple criteria
+- **Server metadata** -- `CAPABILITY`, `NAMESPACE`, `QUOTA`, `ID`
+- **Persistent SQLite cache** with optional AES encryption (Fernet, per-account keys) -- emails and attachments stored locally for fast offline access
 - **Cross-platform secure credential storage** via OS keyring (macOS Keychain / Windows Credential Locker / Linux SecretService)
 - **Flexible cache loading** -- recent N emails, new-only, older (paginate backwards), or date range
 - **Cache-first reads** -- subsequent queries served from local cache without hitting the IMAP server
-- **IMAP IDLE watching** for real-time notifications across multiple mailboxes
+- **IMAP IDLE watching** for real-time notifications across multiple mailboxes (per-account, opt-in via `cache.enabled`)
 - **Auto-archive** -- automatically archive emails from configured sender patterns
-- **Draft composition** with configurable signature (text and HTML) and file attachments
 - **Bulk email sorting** via MCP tools -- move thousands of emails into folders by sender patterns
+
+## Multi-account configuration
+
+The new config format wraps every account in an `accounts` array. Each account has its own IMAP/SMTP/Sieve servers, credentials, folders, cache (with its own encryption key), and auto-archive list. Mark exactly one account with `"default": true` (you can skip the flag if there's only one account).
+
+```json
+{
+  "accounts": [
+    { "name": "work",     "default": true,  "imap": {...}, "smtp": {...}, "credentials": {...}, "cache": {"enabled": true, "encrypt": true} },
+    { "name": "personal",                   "imap": {...}, "smtp": {...}, "credentials": {...}, "cache": {"enabled": false, "encrypt": false} }
+  ]
+}
+```
+
+Every tool takes an optional `account` parameter:
+
+```
+fetch_emails(account="work", mailbox="INBOX", limit=20)
+send_email(account="personal", to=["..."], subject="...", body="...")
+search_emails_fts(account="work", query="invoice 2026")
+```
+
+Omit `account` to use the one marked `default: true` (or the only account when there's just one).
+
+### Migrating from the old single-account config
+
+```bash
+imap-mcp --migrate-config --config /path/to/config.json
+# Backup is written to /path/to/config.json.bak
+```
+
+This wraps the old top-level `imap` / `smtp` / `credentials` / `user` / `folders` / `cache` / `auto_archive` blocks into `accounts:[{ "name": "default", "default": true, ... }]`.
+
+### Storing passwords with multiple accounts
+
+```bash
+imap-mcp --set-password --config /path/to/config.json --account work
+imap-mcp --set-password --config /path/to/config.json --account personal
+```
+
+Each account's password is keyed by its `credentials.username` in the OS keyring, so they stay independent.
 
 ## Read-only vs write mode
 
@@ -368,7 +416,7 @@ Use `get_cache_stats` to see how many emails are cached, database size, and encr
 | `authenticate` | Manual login with username/password |
 | `disconnect` | Close connection and stop watchers |
 
-### Mailbox management (4 tools)
+### Mailbox management (7 tools, +3 destructive under --write)
 
 | Tool | Description |
 |------|-------------|
@@ -376,6 +424,12 @@ Use `get_cache_stats` to see how many emails are cached, database size, and encr
 | `select_mailbox` | Open a mailbox folder |
 | `create_mailbox` | Create a new folder |
 | `get_mailbox_status` | Get message count, unseen, UIDNEXT, etc. |
+| `subscribe_mailbox` | Add mailbox to subscribed list (LSUB) |
+| `unsubscribe_mailbox` | Remove mailbox from subscribed list |
+| `list_subscribed_mailboxes` | List subscribed mailboxes |
+| `rename_mailbox` *(--write)* | Rename a folder |
+| `delete_mailbox` *(--write)* | Delete a folder |
+| `empty_mailbox` *(--write)* | Wipe every message in a folder (`\Deleted` + `EXPUNGE`) |
 
 ### Email reading (7 tools)
 
@@ -389,7 +443,7 @@ Use `get_cache_stats` to see how many emails are cached, database size, and encr
 | `download_attachment` | Download attachment content (base64) |
 | `get_thread` | Get email conversation thread |
 
-### Search (6 tools)
+### Search (9 tools)
 
 | Tool | Description |
 |------|-------------|
@@ -399,8 +453,11 @@ Use `get_cache_stats` to see how many emails are cached, database size, and encr
 | `search_by_date` | Search by date range |
 | `search_unread` | Get all unread emails |
 | `search_flagged` | Get all flagged/starred emails |
+| `search_advanced` | Combined query: sender/recipient/subject/date/has_attachments/unread/flagged in one call (server-side IMAP SEARCH or local FTS) |
+| `search_emails_fts` | Full-text search over the local SQLite FTS5 index (subject, body, addresses) |
+| `rebuild_search_index` | Rebuild the FTS5 index from cached email bodies |
 
-### Actions (8 tools)
+### Actions (12 tools)
 
 | Tool | Description |
 |------|-------------|
@@ -412,6 +469,10 @@ Use `get_cache_stats` to see how many emails are cached, database size, and encr
 | `copy_email` | Copy emails to another folder |
 | `archive_email` | Move emails to Archive folder |
 | `save_draft` | Save a draft with optional signature and file attachments |
+| `update_draft` | Replace a draft (APPEND new + EXPUNGE old; returns new UID) |
+| `delete_draft` | Permanently delete one draft from the Drafts folder |
+| `report_spam` | Move to Spam folder + add `$Junk` keyword (trains server-side filters) |
+| `mark_not_spam` | Move out of Spam, clear `$Junk`, set `$NotJunk` |
 
 ### Write-mode actions (4 tools, require `--write`)
 
@@ -456,6 +517,28 @@ Use `get_cache_stats` to see how many emails are cached, database size, and encr
 | `remove_auto_archive_sender` | Remove a sender from auto-archive |
 | `reload_auto_archive` | Reload sender list from file |
 | `process_auto_archive` | Archive matching emails (supports dry_run) |
+
+### Server metadata (4 tools)
+
+| Tool | Description |
+|------|-------------|
+| `get_capabilities` | IMAP `CAPABILITY` (e.g. `IDLE`, `THREAD=REFERENCES`, `QUOTA`) |
+| `get_namespace` | IMAP `NAMESPACE` (personal/other/shared prefixes) |
+| `get_quota` | IMAP `QUOTA` usage for a mailbox |
+| `get_server_id` | IMAP `ID` server info (RFC 2971) |
+
+### Sieve / server-side rules (3 read tools, +3 under --write)
+
+ManageSieve (RFC 5804) tools require `sieve.host` configured for the account. Server connections are short-lived (one operation per connection).
+
+| Tool | Description |
+|------|-------------|
+| `sieve_list_scripts` | List all Sieve scripts and which one is active |
+| `sieve_get_script` | Fetch the source of a script by name |
+| `sieve_check_script` | Validate a script against the server (`CHECKSCRIPT`) |
+| `sieve_put_script` *(--write)* | Upload (create/replace) a script |
+| `sieve_delete_script` *(--write)* | Delete a script |
+| `sieve_activate_script` *(--write)* | Activate a script (or pass empty name to deactivate all) |
 
 ## Requirements
 

@@ -40,11 +40,20 @@ class MailboxCache:
 
 
 class ImapWatcher:
-    """Permanent IMAP IDLE watcher with in-memory cache."""
+    """Permanent IMAP IDLE watcher with in-memory cache.
 
-    def __init__(self, config_path: str = "config.json"):
+    Can be constructed either from a config file path (legacy single-account
+    mode, kept for backwards compatibility) or from an already-parsed
+    per-account config dict (multi-account mode).
+    """
+
+    def __init__(
+        self,
+        config_path: Optional[str] = None,
+        config: Optional[dict] = None,
+    ):
         self.config_path = config_path
-        self.config: dict = {}
+        self.config: dict = config or {}
         self.cache: dict[str, MailboxCache] = {}
         self.watch_threads: dict[str, threading.Thread] = {}
         self.stop_events: dict[str, threading.Event] = {}
@@ -53,10 +62,14 @@ class ImapWatcher:
         self._lock = threading.Lock()
 
     def load_config(self) -> dict:
-        """Load configuration."""
+        """Load configuration if a path was supplied. No-op when an explicit
+        config dict was passed to the constructor."""
+        if self.config:
+            return self.config
+        if not self.config_path:
+            return {}
         path = Path(self.config_path)
         if not path.is_absolute():
-            # Resolve relative to project root (two levels up from this module)
             project_root = Path(__file__).parent.parent.parent
             path = project_root / self.config_path
         if path.exists():

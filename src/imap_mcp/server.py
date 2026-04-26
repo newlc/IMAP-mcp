@@ -12,18 +12,20 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
-from .imap_client import ImapClientWrapper
+from .accounts import AccountManager
 
 
-# Global IMAP client instance
-imap_client = ImapClientWrapper()
-
-# Config path (set from CLI --config argument)
+# Module-level state.
+# ``account_manager`` holds every configured account; tool handlers route
+# calls through it. ``_config_path`` is set from the CLI ``--config``
+# argument so the (still-supported) ``auto_connect`` tool can find the
+# config file on demand.
+account_manager = AccountManager()
 _config_path = "config.json"
 
 # Write-mode flag (set from CLI --write argument). When False, the server runs
-# read-only: tools that send mail or delete messages are not exposed and will
-# refuse to run if invoked anyway.
+# read-only: tools that send mail, delete messages, mutate folders, or change
+# server-side filters are not exposed and refuse to run if invoked anyway.
 _write_enabled = False
 
 # Names of tools that require --write mode.
@@ -32,10 +34,45 @@ WRITE_TOOL_NAMES = frozenset({
     "reply_email",
     "forward_email",
     "delete_email",
+    "rename_mailbox",
+    "delete_mailbox",
+    "empty_mailbox",
+    "sieve_put_script",
+    "sieve_delete_script",
+    "sieve_activate_script",
 })
 
 # Create MCP server
 server = Server("imap-mcp")
+
+
+# Reusable schema fragment for the per-tool ``account`` selector.
+_ACCOUNT_PROP = {
+    "type": "string",
+    "description": (
+        "Account name (matches accounts[].name in config.json). "
+        "Omit to use the default account."
+    ),
+}
+
+
+def _client(account: Optional[str]):
+    """Return the wrapper for the requested account (lazily connecting)."""
+    return account_manager.get(account)
+
+
+# Backwards-compatibility shim: legacy tests reference ``srv.imap_client``
+# expecting it to behave like a single ImapClientWrapper. Now that the server
+# is multi-account, route attribute access to the default account's wrapper.
+class _DefaultAccountProxy:
+    def __getattr__(self, name):
+        return getattr(account_manager.get(None), name)
+
+    def __setattr__(self, name, value):
+        setattr(account_manager.get(None), name, value)
+
+
+imap_client = _DefaultAccountProxy()
 
 
 def make_tool(
@@ -43,8 +80,17 @@ def make_tool(
     description: str,
     properties: dict,
     required: Optional[list[str]] = None,
+    multi_account: bool = True,
 ) -> Tool:
-    """Helper to create a Tool definition with a JSON Schema input."""
+    """Helper to create a Tool definition with a JSON Schema input.
+
+    Unless ``multi_account=False`` is passed (for global tools like
+    ``auto_connect`` or ``list_accounts``), an optional ``account``
+    parameter is automatically merged into every tool so callers can
+    target any configured account.
+    """
+    if multi_account:
+        properties = {**properties, "account": _ACCOUNT_PROP}
     return Tool(
         name=name,
         description=description,
@@ -65,37 +111,31 @@ async def list_tools() -> list[Tool]:
     started with ``--write``.
     """
     base_tools = [
-        # === Connection ===
+        # === Connection / accounts ===
         make_tool(
-            "connect",
-            "Establish IMAP connection to mail server",
-            {
-                "host": {"type": "string", "description": "IMAP server hostname"},
-                "port": {"type": "number", "description": "IMAP port (default: 993)"},
-                "secure": {"type": "boolean", "description": "Use SSL/TLS (default: true)"},
-            },
-            ["host"],
+            "auto_connect",
+            "Load config.json (multi-account format) and start IDLE watchers "
+            "for accounts with cache.enabled=true. Other accounts connect "
+            "lazily on first use.",
+            {},
+            multi_account=False,
         ),
         make_tool(
-            "authenticate",
-            "Login with username and password",
-            {
-                "username": {"type": "string", "description": "Email username"},
-                "password": {"type": "string", "description": "Email password or app password"},
-                "smtpHost": {"type": "string", "description": "SMTP server hostname (optional, for drafts)"},
-                "smtpPort": {"type": "number", "description": "SMTP port (default: 587)"},
-            },
-            ["username", "password"],
+            "list_accounts",
+            "List configured accounts (name, default, IMAP host, cache settings, "
+            "connection state).",
+            {},
+            multi_account=False,
         ),
         make_tool(
             "disconnect",
-            "Close IMAP connection",
-            {},
-        ),
-        make_tool(
-            "auto_connect",
-            "Connect using config.json credentials (no parameters needed)",
-            {},
+            "Close the IMAP connection for one account, or all accounts when "
+            "called without 'account'.",
+            {
+                "account": {**_ACCOUNT_PROP,
+                            "description": "Account to disconnect; omit for all accounts."},
+            },
+            multi_account=False,
         ),
         # === Mailboxes ===
         make_tool(
@@ -508,6 +548,166 @@ async def list_tools() -> list[Tool]:
                 "dry_run": {"type": "boolean", "description": "If true, only report what would be archived without moving (default: false)"},
             },
         ),
+        # === Folder management (read-only-friendly) ===
+        make_tool(
+            "subscribe_mailbox",
+            "Add a mailbox to the subscribed list (LSUB).",
+            {"mailbox": {"type": "string", "description": "Mailbox name"}},
+            ["mailbox"],
+        ),
+        make_tool(
+            "unsubscribe_mailbox",
+            "Remove a mailbox from the subscribed list.",
+            {"mailbox": {"type": "string", "description": "Mailbox name"}},
+            ["mailbox"],
+        ),
+        make_tool(
+            "list_subscribed_mailboxes",
+            "List subscribed mailboxes (LSUB).",
+            {"pattern": {"type": "string", "description": "Filter pattern (default: *)"}},
+        ),
+        # === Draft management ===
+        make_tool(
+            "update_draft",
+            "Replace an existing draft. APPENDs the new draft and EXPUNGEs the old "
+            "UID from the Drafts folder. Returns the new UID when supported.",
+            {
+                "uid": {"type": "number", "description": "UID of the draft to replace"},
+                "to": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "Recipient addresses",
+                },
+                "subject": {"type": "string", "description": "Draft subject"},
+                "body": {"type": "string", "description": "Draft body (plain text)"},
+                "cc": {"type": "array", "items": {"type": "string"}, "description": "CC addresses"},
+                "bcc": {"type": "array", "items": {"type": "string"}, "description": "BCC addresses"},
+                "htmlBody": {"type": "string", "description": "Draft body (HTML)"},
+                "attachments": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "Local file paths to attach",
+                },
+                "draftsFolder": {"type": "string", "description": "Drafts folder (default: Drafts)"},
+                "includeSignature": {"type": "boolean", "description": "Include signature (default: true)"},
+            },
+            ["uid", "to", "subject", "body"],
+        ),
+        make_tool(
+            "delete_draft",
+            "Permanently delete one draft (\\Deleted + EXPUNGE in the Drafts folder).",
+            {
+                "uid": {"type": "number", "description": "UID of the draft to delete"},
+                "draftsFolder": {"type": "string", "description": "Drafts folder (default: Drafts)"},
+            },
+            ["uid"],
+        ),
+        # === Spam ===
+        make_tool(
+            "report_spam",
+            "Move messages to the Spam folder and add the junk flag (default: $Junk). "
+            "Trains server-side filters that respect IMAP keywords.",
+            {
+                "uids": {
+                    "type": "array", "items": {"type": "number"},
+                    "description": "Email UIDs",
+                },
+                "mailbox": {"type": "string", "description": "Source mailbox (default: current)"},
+                "spamFolder": {"type": "string", "description": "Spam folder (default: from folders.spam or 'Spam')"},
+                "flag": {"type": "string", "description": "Junk flag to set (default: $Junk; pass empty string to skip)"},
+            },
+            ["uids"],
+        ),
+        make_tool(
+            "mark_not_spam",
+            "Move messages out of the Spam folder back to INBOX (or destination), "
+            "remove the junk flag and add $NotJunk where supported.",
+            {
+                "uids": {
+                    "type": "array", "items": {"type": "number"},
+                    "description": "Email UIDs",
+                },
+                "mailbox": {"type": "string", "description": "Source mailbox (default: from folders.spam or 'Spam')"},
+                "destination": {"type": "string", "description": "Destination folder (default: from folders.inbox or 'INBOX')"},
+            },
+            ["uids"],
+        ),
+        # === Search (advanced + FTS) ===
+        make_tool(
+            "search_advanced",
+            "Combined IMAP SEARCH or local FTS5 query with multiple criteria "
+            "(query, from, to, subject, date range, has_attachments, unread, flagged).",
+            {
+                "query": {"type": "string", "description": "Free-text query (TEXT for IMAP, MATCH for FTS)"},
+                "from_addr": {"type": "string", "description": "Filter by sender"},
+                "to_addr": {"type": "string", "description": "Filter by recipient"},
+                "subject": {"type": "string", "description": "Filter by subject substring"},
+                "since": {"type": "string", "description": "ISO date (inclusive)"},
+                "before": {"type": "string", "description": "ISO date (exclusive)"},
+                "has_attachments": {"type": "boolean", "description": "Only with/without attachments"},
+                "unread": {"type": "boolean", "description": "Only unread (true) / read (false) / either (omit)"},
+                "flagged": {"type": "boolean", "description": "Only flagged / unflagged"},
+                "mailbox": {"type": "string", "description": "Mailbox to search (default: current)"},
+                "use_fts": {"type": "boolean", "description": "Use local FTS5 over cached bodies (requires load_cache; default: false)"},
+                "limit": {"type": "number", "description": "Max results (default: 50)"},
+            },
+        ),
+        make_tool(
+            "search_emails_fts",
+            "Full-text search over the local FTS5 index. Requires that the cache "
+            "has been populated via load_cache.",
+            {
+                "query": {"type": "string", "description": "FTS5 MATCH expression (e.g. 'invoice 2026', 'subject:report')"},
+                "mailbox": {"type": "string", "description": "Restrict to one mailbox (optional)"},
+                "limit": {"type": "number", "description": "Max results (default: 50)"},
+            },
+            ["query"],
+        ),
+        make_tool(
+            "rebuild_search_index",
+            "Rebuild the FTS5 index from cached email bodies.",
+            {
+                "mailbox": {"type": "string", "description": "Restrict to one mailbox (default: all)"},
+            },
+        ),
+        # === Server metadata ===
+        make_tool(
+            "get_capabilities",
+            "Return the IMAP server's CAPABILITY list (e.g. IDLE, THREAD=REFERENCES, QUOTA).",
+            {},
+        ),
+        make_tool(
+            "get_namespace",
+            "Return the IMAP NAMESPACE (personal/other/shared) for this server.",
+            {},
+        ),
+        make_tool(
+            "get_quota",
+            "Return IMAP QUOTA usage for a mailbox (default: INBOX).",
+            {"mailbox": {"type": "string", "description": "Mailbox name (default: INBOX)"}},
+        ),
+        make_tool(
+            "get_server_id",
+            "Return server-side ID info via IMAP ID (RFC 2971), if supported.",
+            {},
+        ),
+        # === Sieve (server-side rules) -- read-only ===
+        make_tool(
+            "sieve_list_scripts",
+            "List Sieve scripts on the ManageSieve server (RFC 5804). "
+            "Requires sieve.host configured for the account.",
+            {},
+        ),
+        make_tool(
+            "sieve_get_script",
+            "Fetch the source of a Sieve script by name.",
+            {"name": {"type": "string", "description": "Script name"}},
+            ["name"],
+        ),
+        make_tool(
+            "sieve_check_script",
+            "Validate a Sieve script's syntax against the server (CHECKSCRIPT).",
+            {"content": {"type": "string", "description": "Sieve script source"}},
+            ["content"],
+        ),
     ]
 
     # === Write-mode tools (only exposed when --write is set) ===
@@ -619,6 +819,53 @@ async def list_tools() -> list[Tool]:
             },
             ["uids"],
         ),
+        # === Folder management (destructive) ===
+        make_tool(
+            "rename_mailbox",
+            "Rename a mailbox folder. Requires --write mode.",
+            {
+                "old_name": {"type": "string", "description": "Existing mailbox name"},
+                "new_name": {"type": "string", "description": "New mailbox name"},
+            },
+            ["old_name", "new_name"],
+        ),
+        make_tool(
+            "delete_mailbox",
+            "Delete a mailbox folder. Some servers refuse to delete non-empty "
+            "folders. Requires --write mode.",
+            {"mailbox": {"type": "string", "description": "Mailbox name"}},
+            ["mailbox"],
+        ),
+        make_tool(
+            "empty_mailbox",
+            "Delete every message in a mailbox (\\Deleted + EXPUNGE) but keep the "
+            "folder itself. Requires --write mode.",
+            {"mailbox": {"type": "string", "description": "Mailbox name"}},
+            ["mailbox"],
+        ),
+        # === Sieve (server-side rules) -- write ===
+        make_tool(
+            "sieve_put_script",
+            "Upload (create or replace) a Sieve script. Requires --write mode.",
+            {
+                "name": {"type": "string", "description": "Script name"},
+                "content": {"type": "string", "description": "Sieve script source"},
+            },
+            ["name", "content"],
+        ),
+        make_tool(
+            "sieve_delete_script",
+            "Delete a Sieve script by name. Requires --write mode.",
+            {"name": {"type": "string", "description": "Script name"}},
+            ["name"],
+        ),
+        make_tool(
+            "sieve_activate_script",
+            "Activate a Sieve script (or pass empty name to deactivate all). "
+            "Requires --write mode.",
+            {"name": {"type": "string", "description": "Script name (empty = none active)"}},
+            ["name"],
+        ),
     ]
 
     if _write_enabled:
@@ -660,39 +907,67 @@ async def handle_tool_call(name: str, args: dict) -> Any:
     if name in WRITE_TOOL_NAMES and not _write_enabled:
         raise PermissionError(
             f"Tool '{name}' is disabled in read-only mode. "
-            "Restart imap-mcp with --write to enable email sending and deletion."
+            "Restart imap-mcp with --write to enable destructive operations."
         )
 
-    # === Connection ===
-    if name == "connect":
-        return imap_client.connect(
-            host=args["host"],
-            port=args.get("port", 993),
-            secure=args.get("secure", True),
-        )
-    elif name == "authenticate":
-        return imap_client.authenticate(
-            username=args["username"],
-            password=args["password"],
-        )
+    account = args.get("account")
+
+    # ------------------------------------------------------------------
+    # Global tools that don't target a specific account
+    # ------------------------------------------------------------------
+    if name == "auto_connect":
+        account_manager.load_config(_config_path)
+        return {
+            "loaded": True,
+            "config_path": _config_path,
+            "default_account": account_manager.default_name,
+            "accounts": account_manager.list_accounts(),
+        }
+    elif name == "list_accounts":
+        return account_manager.list_accounts()
     elif name == "disconnect":
-        return imap_client.disconnect()
-    elif name == "auto_connect":
-        return imap_client.auto_connect(_config_path)
+        if account:
+            account_manager.get_account(account).disconnect()
+            return {"disconnected": account}
+        account_manager.disconnect_all()
+        return {"disconnected": "all"}
 
-    # === Mailboxes ===
-    elif name == "list_mailboxes":
-        return imap_client.list_mailboxes(pattern=args.get("pattern", "*"))
+    # Anything below requires an initialized account manager.
+    if not account_manager.has_accounts():
+        raise RuntimeError(
+            "No accounts loaded. Call auto_connect first."
+        )
+    cli = _client(account)
+
+    # ------------------------------------------------------------------
+    # Mailboxes
+    # ------------------------------------------------------------------
+    if name == "list_mailboxes":
+        return cli.list_mailboxes(pattern=args.get("pattern", "*"))
     elif name == "select_mailbox":
-        return imap_client.select_mailbox(args["mailbox"])
+        return cli.select_mailbox(args["mailbox"])
     elif name == "create_mailbox":
-        return imap_client.create_mailbox(args["mailbox"])
+        return cli.create_mailbox(args["mailbox"])
     elif name == "get_mailbox_status":
-        return imap_client.get_mailbox_status(args["mailbox"])
+        return cli.get_mailbox_status(args["mailbox"])
+    elif name == "rename_mailbox":
+        return cli.rename_mailbox(args["old_name"], args["new_name"])
+    elif name == "delete_mailbox":
+        return cli.delete_mailbox(args["mailbox"])
+    elif name == "empty_mailbox":
+        return cli.empty_mailbox(args["mailbox"])
+    elif name == "subscribe_mailbox":
+        return cli.subscribe_mailbox(args["mailbox"])
+    elif name == "unsubscribe_mailbox":
+        return cli.unsubscribe_mailbox(args["mailbox"])
+    elif name == "list_subscribed_mailboxes":
+        return cli.list_subscribed_mailboxes(pattern=args.get("pattern", "*"))
 
-    # === Email Reading ===
+    # ------------------------------------------------------------------
+    # Email reading
+    # ------------------------------------------------------------------
     elif name == "fetch_emails":
-        return imap_client.fetch_emails(
+        return cli.fetch_emails(
             mailbox=args.get("mailbox"),
             limit=args.get("limit", 20),
             offset=args.get("offset", 0),
@@ -700,28 +975,19 @@ async def handle_tool_call(name: str, args: dict) -> Any:
             before=args.get("before"),
         )
     elif name == "get_email":
-        return imap_client.get_email(
-            uid=args["uid"],
-            mailbox=args.get("mailbox"),
-        )
+        return cli.get_email(uid=args["uid"], mailbox=args.get("mailbox"))
     elif name == "get_email_headers":
-        return imap_client.get_email_headers(
-            uid=args["uid"],
-            mailbox=args.get("mailbox"),
-        )
+        return cli.get_email_headers(uid=args["uid"], mailbox=args.get("mailbox"))
     elif name == "get_email_body":
-        return imap_client.get_email_body(
+        return cli.get_email_body(
             uid=args["uid"],
             mailbox=args.get("mailbox"),
             format=args.get("format", "text"),
         )
     elif name == "get_attachments":
-        return imap_client.get_attachments(
-            uid=args["uid"],
-            mailbox=args.get("mailbox"),
-        )
+        return cli.get_attachments(uid=args["uid"], mailbox=args.get("mailbox"))
     elif name == "download_attachment":
-        filename, content_type, data = imap_client.download_attachment(
+        filename, content_type, data = cli.download_attachment(
             uid=args["uid"],
             attachment_index=args["attachmentIndex"],
             mailbox=args.get("mailbox"),
@@ -732,91 +998,105 @@ async def handle_tool_call(name: str, args: dict) -> Any:
             "data": data.decode("ascii"),
         }
     elif name == "get_thread":
-        return imap_client.get_thread(
-            uid=args["uid"],
-            mailbox=args.get("mailbox"),
-        )
+        return cli.get_thread(uid=args["uid"], mailbox=args.get("mailbox"))
 
-    # === Search ===
+    # ------------------------------------------------------------------
+    # Search
+    # ------------------------------------------------------------------
     elif name == "search_emails":
-        return imap_client.search_emails(
+        return cli.search_emails(
             query=args["query"],
             mailbox=args.get("mailbox"),
             limit=args.get("limit", 50),
         )
     elif name == "search_by_sender":
-        return imap_client.search_by_sender(
+        return cli.search_by_sender(
             sender=args["sender"],
             mailbox=args.get("mailbox"),
             limit=args.get("limit", 50),
         )
     elif name == "search_by_subject":
-        return imap_client.search_by_subject(
+        return cli.search_by_subject(
             subject=args["subject"],
             mailbox=args.get("mailbox"),
             limit=args.get("limit", 50),
         )
     elif name == "search_by_date":
-        return imap_client.search_by_date(
+        return cli.search_by_date(
             mailbox=args.get("mailbox"),
             since=args.get("since"),
             before=args.get("before"),
             limit=args.get("limit", 50),
         )
     elif name == "search_unread":
-        return imap_client.search_unread(
+        return cli.search_unread(
             mailbox=args.get("mailbox"),
             limit=args.get("limit", 50),
         )
     elif name == "search_flagged":
-        return imap_client.search_flagged(
+        return cli.search_flagged(
             mailbox=args.get("mailbox"),
             limit=args.get("limit", 50),
         )
+    elif name == "search_advanced":
+        return cli.search_advanced(
+            query=args.get("query"),
+            from_addr=args.get("from_addr"),
+            to_addr=args.get("to_addr"),
+            subject=args.get("subject"),
+            since=args.get("since"),
+            before=args.get("before"),
+            has_attachments=args.get("has_attachments"),
+            unread=args.get("unread"),
+            flagged=args.get("flagged"),
+            mailbox=args.get("mailbox"),
+            use_fts=args.get("use_fts", False),
+            limit=args.get("limit", 50),
+        )
+    elif name == "search_emails_fts":
+        return cli.search_emails_fts(
+            query=args["query"],
+            mailbox=args.get("mailbox"),
+            limit=args.get("limit", 50),
+        )
+    elif name == "rebuild_search_index":
+        return cli.rebuild_search_index(mailbox=args.get("mailbox"))
 
-    # === Actions ===
+    # ------------------------------------------------------------------
+    # Actions (read-only-friendly)
+    # ------------------------------------------------------------------
     elif name == "mark_read":
-        return imap_client.mark_read(
-            uids=args["uids"],
-            mailbox=args.get("mailbox"),
-        )
+        return cli.mark_read(uids=args["uids"], mailbox=args.get("mailbox"))
     elif name == "mark_unread":
-        return imap_client.mark_unread(
-            uids=args["uids"],
-            mailbox=args.get("mailbox"),
-        )
+        return cli.mark_unread(uids=args["uids"], mailbox=args.get("mailbox"))
     elif name == "flag_email":
-        return imap_client.flag_email(
-            uids=args["uids"],
-            flag=args["flag"],
-            mailbox=args.get("mailbox"),
+        return cli.flag_email(
+            uids=args["uids"], flag=args["flag"], mailbox=args.get("mailbox")
         )
     elif name == "unflag_email":
-        return imap_client.unflag_email(
-            uids=args["uids"],
-            flag=args["flag"],
-            mailbox=args.get("mailbox"),
+        return cli.unflag_email(
+            uids=args["uids"], flag=args["flag"], mailbox=args.get("mailbox")
         )
     elif name == "move_email":
-        return imap_client.move_email(
+        return cli.move_email(
             uids=args["uids"],
             destination=args["destination"],
             mailbox=args.get("mailbox"),
         )
     elif name == "copy_email":
-        return imap_client.copy_email(
+        return cli.copy_email(
             uids=args["uids"],
             destination=args["destination"],
             mailbox=args.get("mailbox"),
         )
     elif name == "archive_email":
-        return imap_client.archive_email(
+        return cli.archive_email(
             uids=args["uids"],
             mailbox=args.get("mailbox"),
             archive_folder=args.get("archiveFolder", "Archive"),
         )
     elif name == "save_draft":
-        return imap_client.save_draft(
+        return cli.save_draft(
             to=args["to"],
             subject=args["subject"],
             body=args["body"],
@@ -827,10 +1107,9 @@ async def handle_tool_call(name: str, args: dict) -> Any:
             drafts_folder=args.get("draftsFolder", "Drafts"),
             include_signature=args.get("includeSignature", True),
         )
-
-    # === Write-mode actions ===
-    elif name == "send_email":
-        return imap_client.send_email(
+    elif name == "update_draft":
+        return cli.update_draft(
+            uid=args["uid"],
             to=args["to"],
             subject=args["subject"],
             body=args["body"],
@@ -838,14 +1117,44 @@ async def handle_tool_call(name: str, args: dict) -> Any:
             bcc=args.get("bcc"),
             html_body=args.get("htmlBody"),
             attachments=args.get("attachments"),
+            drafts_folder=args.get("draftsFolder", "Drafts"),
+            include_signature=args.get("includeSignature", True),
+        )
+    elif name == "delete_draft":
+        return cli.delete_draft(
+            uid=args["uid"],
+            drafts_folder=args.get("draftsFolder", "Drafts"),
+        )
+    elif name == "report_spam":
+        return cli.report_spam(
+            uids=args["uids"],
+            mailbox=args.get("mailbox"),
+            spam_folder=args.get("spamFolder"),
+            flag=args.get("flag"),
+        )
+    elif name == "mark_not_spam":
+        return cli.mark_not_spam(
+            uids=args["uids"],
+            mailbox=args.get("mailbox"),
+            destination=args.get("destination"),
+        )
+
+    # ------------------------------------------------------------------
+    # Write-mode actions
+    # ------------------------------------------------------------------
+    elif name == "send_email":
+        return cli.send_email(
+            to=args["to"], subject=args["subject"], body=args["body"],
+            cc=args.get("cc"), bcc=args.get("bcc"),
+            html_body=args.get("htmlBody"),
+            attachments=args.get("attachments"),
             include_signature=args.get("includeSignature", True),
             save_to_sent=args.get("saveToSent", True),
             sent_folder=args.get("sentFolder"),
         )
     elif name == "reply_email":
-        return imap_client.reply_email(
-            uid=args["uid"],
-            body=args["body"],
+        return cli.reply_email(
+            uid=args["uid"], body=args["body"],
             mailbox=args.get("mailbox"),
             html_body=args.get("htmlBody"),
             reply_all=args.get("replyAll", False),
@@ -855,13 +1164,10 @@ async def handle_tool_call(name: str, args: dict) -> Any:
             save_to_sent=args.get("saveToSent", True),
         )
     elif name == "forward_email":
-        return imap_client.forward_email(
-            uid=args["uid"],
-            to=args["to"],
-            body=args.get("body", ""),
+        return cli.forward_email(
+            uid=args["uid"], to=args["to"], body=args.get("body", ""),
             mailbox=args.get("mailbox"),
-            cc=args.get("cc"),
-            bcc=args.get("bcc"),
+            cc=args.get("cc"), bcc=args.get("bcc"),
             html_body=args.get("htmlBody"),
             include_attachments=args.get("includeAttachments", True),
             extra_attachments=args.get("extraAttachments"),
@@ -869,51 +1175,44 @@ async def handle_tool_call(name: str, args: dict) -> Any:
             save_to_sent=args.get("saveToSent", True),
         )
     elif name == "delete_email":
-        return imap_client.delete_email(
+        return cli.delete_email(
             uids=args["uids"],
             mailbox=args.get("mailbox"),
             permanent=args.get("permanent", False),
             trash_folder=args.get("trashFolder"),
         )
 
-    # === Statistics ===
+    # ------------------------------------------------------------------
+    # Statistics, cache, watch, sync (unchanged)
+    # ------------------------------------------------------------------
     elif name == "get_unread_count":
-        return imap_client.get_unread_count(
-            mailbox=args.get("mailbox", "INBOX"),
-        )
+        return cli.get_unread_count(mailbox=args.get("mailbox", "INBOX"))
     elif name == "get_total_count":
-        return imap_client.get_total_count(
-            mailbox=args.get("mailbox", "INBOX"),
-        )
-
-    # === Cache & Watch ===
+        return cli.get_total_count(mailbox=args.get("mailbox", "INBOX"))
     elif name == "get_cached_overview":
-        return imap_client.get_cached_overview(
-            mailbox=args.get("mailbox"),
-            limit=args.get("limit", 20),
+        return cli.get_cached_overview(
+            mailbox=args.get("mailbox"), limit=args.get("limit", 20)
         )
     elif name == "refresh_cache":
-        return imap_client.refresh_cache()
+        return cli.refresh_cache()
     elif name == "start_watch":
-        return imap_client.start_watch()
+        return cli.start_watch()
     elif name == "stop_watch":
-        return imap_client.stop_watch()
+        return cli.stop_watch()
     elif name == "idle_watch":
-        return imap_client.idle_watch(
+        return cli.idle_watch(
             mailbox=args.get("mailbox", "INBOX"),
             timeout=args.get("timeout", 300),
         )
-
-    # === Sync & Persistent Cache ===
     elif name == "sync_emails":
-        return imap_client.sync_emails(
+        return cli.sync_emails(
             mailbox=args.get("mailbox", "INBOX"),
             since=args.get("since"),
             before=args.get("before"),
             full=args.get("full", False),
         )
     elif name == "load_cache":
-        return imap_client.load_cache(
+        return cli.load_cache(
             mailbox=args.get("mailbox", "INBOX"),
             mode=args.get("mode", "recent"),
             count=args.get("count", 100),
@@ -922,29 +1221,82 @@ async def handle_tool_call(name: str, args: dict) -> Any:
             include_attachments=args.get("include_attachments", True),
         )
     elif name == "get_cache_stats":
-        return imap_client.get_cache_stats()
+        return cli.get_cache_stats()
 
-    # === Auto-Archive ===
+    # ------------------------------------------------------------------
+    # Server metadata
+    # ------------------------------------------------------------------
+    elif name == "get_capabilities":
+        return cli.get_capabilities()
+    elif name == "get_namespace":
+        return cli.get_namespace()
+    elif name == "get_quota":
+        return cli.get_quota(mailbox=args.get("mailbox"))
+    elif name == "get_server_id":
+        return cli.get_server_id()
+
+    # ------------------------------------------------------------------
+    # Auto-archive
+    # ------------------------------------------------------------------
     elif name == "get_auto_archive_list":
-        return imap_client.get_auto_archive_list()
+        return cli.get_auto_archive_list()
     elif name == "add_auto_archive_sender":
-        return imap_client.add_auto_archive_sender(
-            email_addr=args["email"],
-            comment=args.get("comment"),
+        return cli.add_auto_archive_sender(
+            email_addr=args["email"], comment=args.get("comment")
         )
     elif name == "remove_auto_archive_sender":
-        return imap_client.remove_auto_archive_sender(
-            email_addr=args["email"],
-        )
+        return cli.remove_auto_archive_sender(email_addr=args["email"])
     elif name == "reload_auto_archive":
-        return imap_client.reload_auto_archive()
+        return cli.reload_auto_archive()
     elif name == "process_auto_archive":
-        return imap_client.process_auto_archive(
-            dry_run=args.get("dry_run", False),
+        return cli.process_auto_archive(dry_run=args.get("dry_run", False))
+
+    # ------------------------------------------------------------------
+    # Sieve (ManageSieve, RFC 5804)
+    # ------------------------------------------------------------------
+    elif name == "sieve_list_scripts":
+        return _sieve_call(account, lambda c: c.listscripts())
+    elif name == "sieve_get_script":
+        return _sieve_call(account, lambda c: {"name": args["name"], "content": c.getscript(args["name"])})
+    elif name == "sieve_check_script":
+        # CHECKSCRIPT is server-side validation; account context still needed
+        # for the connection but it doesn't mutate any state.
+        return _sieve_call(account, lambda c: c.checkscript(args["content"]))
+    elif name == "sieve_put_script":
+        return _sieve_call(
+            account,
+            lambda c: (c.putscript(args["name"], args["content"]),
+                       {"uploaded": args["name"]})[-1],
+        )
+    elif name == "sieve_delete_script":
+        return _sieve_call(
+            account,
+            lambda c: (c.deletescript(args["name"]),
+                       {"deleted": args["name"]})[-1],
+        )
+    elif name == "sieve_activate_script":
+        return _sieve_call(
+            account,
+            lambda c: (c.setactive(args["name"]),
+                       {"active": args["name"] or None})[-1],
         )
 
     else:
         raise ValueError(f"Unknown tool: {name}")
+
+
+def _sieve_call(account: Optional[str], fn):
+    """Open a short-lived ManageSieve connection for ``account`` and run ``fn``."""
+    from .sieve import open_for, SieveError
+    acct = account_manager.get_account(account)
+    try:
+        client = open_for(acct.config, action="manage")
+    except SieveError as exc:
+        raise RuntimeError(str(exc))
+    try:
+        return fn(client)
+    finally:
+        client.logout()
 
 
 def main():
@@ -972,52 +1324,126 @@ def main():
         "--write",
         action="store_true",
         help="Enable write-mode tools (send_email, reply_email, forward_email, "
-             "delete_email). Without this flag the server is read-only -- "
-             "only reading and organizing operations are exposed.",
+             "delete_email, rename_mailbox, delete_mailbox, empty_mailbox, "
+             "sieve_put_script/delete_script/activate_script). Without this "
+             "flag the server is read-only -- only reading and organizing "
+             "operations are exposed.",
+    )
+    parser.add_argument(
+        "--account",
+        default=None,
+        help="Account name (matches accounts[].name). Used together with "
+             "--set-password / --delete-password in multi-account configs. "
+             "Omit to use the default account.",
+    )
+    parser.add_argument(
+        "--migrate-config",
+        action="store_true",
+        help="Rewrite a legacy single-account config.json into the new "
+             "multi-account format. The original is backed up to "
+             "<path>.bak.",
     )
     args = parser.parse_args()
 
+    if args.migrate_config:
+        from .accounts import migrate_legacy_config
+        try:
+            backup = migrate_legacy_config(args.config)
+        except Exception as exc:
+            print(f"Migration failed: {exc}")
+            raise SystemExit(1)
+        print(f"Migrated. Backup written to {backup}")
+        return
+
     if args.set_password or args.delete_password:
-        from .imap_client import store_password, delete_stored_password, ImapClientWrapper
+        from .accounts import AccountManager as _AM
+        from .imap_client import store_password, delete_stored_password
         import getpass
 
-        client = ImapClientWrapper()
-        client.load_config(args.config)
-        username = client.config.get("credentials", {}).get("username", "")
+        with open(args.config) as f:
+            raw = json.load(f)
+
+        if "accounts" not in raw:
+            if _AM.is_legacy_config(raw):
+                print(
+                    "Config uses legacy single-account format. "
+                    "Run 'imap-mcp --migrate-config --config %s' first." % args.config
+                )
+                raise SystemExit(1)
+            print("Error: 'accounts' missing from config.json")
+            raise SystemExit(1)
+
+        accounts = raw["accounts"]
+        if not accounts:
+            print("Error: config.accounts is empty")
+            raise SystemExit(1)
+
+        target = None
+        if args.account:
+            for a in accounts:
+                if a.get("name") == args.account:
+                    target = a
+                    break
+            if target is None:
+                print(f"Error: no account named {args.account!r} in config.")
+                raise SystemExit(1)
+        elif len(accounts) == 1:
+            target = accounts[0]
+        else:
+            defaults = [a for a in accounts if a.get("default")]
+            if len(defaults) == 1:
+                target = defaults[0]
+            else:
+                print(
+                    "Multiple accounts in config; pass --account <name> to "
+                    "select which one."
+                )
+                raise SystemExit(1)
+
+        username = target.get("credentials", {}).get("username", "")
         if not username:
-            print("Error: no credentials.username in config.json")
+            print("Error: account is missing credentials.username")
             raise SystemExit(1)
 
         if args.delete_password:
             delete_stored_password(username)
             print(f"Password deleted from keyring for {username}")
-        else:
-            password = getpass.getpass(f"Enter IMAP password for {username}: ")
+            return
 
-            # Verify the password by connecting to the IMAP server
-            imap_config = client.config.get("imap", {})
-            host = imap_config.get("host")
-            port = imap_config.get("port", 993)
-            secure = imap_config.get("secure", True)
-
-            print(f"Verifying connection to {host}:{port}...")
-            try:
-                from imapclient import IMAPClient
-                test_client = IMAPClient(host, port=port, ssl=secure)
-                test_client.login(username, password)
-                test_client.logout()
-            except Exception as e:
-                print(f"Connection failed: {e}")
-                print("Password was NOT saved.")
-                raise SystemExit(1)
-
-            store_password(username, password)
-            print(f"Connection OK. Password stored in keyring for {username}")
+        password = getpass.getpass(f"Enter IMAP password for {username}: ")
+        imap_config = target.get("imap", {})
+        host = imap_config.get("host")
+        port = imap_config.get("port", 993)
+        secure = imap_config.get("secure", True)
+        print(f"Verifying connection to {host}:{port}...")
+        try:
+            from imapclient import IMAPClient
+            test_client = IMAPClient(host, port=port, ssl=secure)
+            test_client.login(username, password)
+            test_client.logout()
+        except Exception as e:
+            print(f"Connection failed: {e}")
+            print("Password was NOT saved.")
+            raise SystemExit(1)
+        store_password(username, password)
+        print(f"Connection OK. Password stored in keyring for {username}")
         return
 
     global _config_path, _write_enabled
     _config_path = args.config
     _write_enabled = bool(args.write)
+
+    # Eagerly load the config so accounts with cache.enabled=true start
+    # their IDLE watchers immediately, mirroring the previous single-account
+    # auto_connect behaviour.
+    try:
+        account_manager.load_config(_config_path)
+    except FileNotFoundError as exc:
+        print(f"Warning: {exc}. Use 'auto_connect' tool to load it later.")
+    except ValueError as exc:
+        print(f"Config error: {exc}")
+        raise SystemExit(1)
+
     asyncio.run(run_server())
 
 

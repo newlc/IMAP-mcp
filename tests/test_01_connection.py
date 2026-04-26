@@ -49,10 +49,9 @@ class TestConnection:
         assert result is True
 
     @patch("imap_mcp.imap_client.IMAPClient")
-    @patch("imap_mcp.imap_client.get_watcher")
     @patch("imap_mcp.imap_client.keyring")
-    def test_auto_connect(self, mock_keyring, mock_get_watcher, mock_imapclient_cls, tmp_path):
-        """Test auto_connect with a config file."""
+    def test_auto_connect(self, mock_keyring, mock_imapclient_cls, tmp_path):
+        """Test auto_connect with a (legacy single-account) config file."""
         import json
 
         config = {
@@ -66,9 +65,6 @@ class TestConnection:
 
         mock_instance = MagicMock()
         mock_imapclient_cls.return_value = mock_instance
-
-        mock_watcher = MagicMock()
-        mock_get_watcher.return_value = mock_watcher
 
         client = ImapClientWrapper()
         result = client.auto_connect(str(config_path))

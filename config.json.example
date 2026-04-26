@@ -1,47 +1,111 @@
 {
-  "imap": {
-    "host": "imap.example.com",
-    "port": 993,
-    "secure": true
-  },
-  "smtp": {
-    "host": "smtp.example.com",
-    "port": 587,
-    "secure": false,
-    "starttls": true
-  },
-  "credentials": {
-    "username": "your-email@example.com",
-    "password": ""
-  },
-  "_comment": "Leave password empty and run 'imap-mcp --set-password' to store it securely in the OS keyring (macOS Keychain / Windows Credential Locker / Linux SecretService)",
-  "user": {
-    "name": "Your Name",
-    "email": "your-email@example.com",
-    "signature": {
-      "enabled": true,
-      "text": "\n\n--\nBest regards,\nYour Name\nTel: +1 555 123 4567\nEmail: your-email@example.com",
-      "html": "<br><br><div style=\"color: #666; font-size: 12px;\">--<br>Best regards,<br><strong>Your Name</strong><br>Tel: +1 555 123 4567<br>Email: your-email@example.com</div>"
+  "_comment": "Multi-account config. Each entry under accounts[] is one independent IMAP/SMTP account with its own cache. Mark exactly one with default:true (skipped if there's only one). Leave credentials.password empty and run 'imap-mcp --set-password --account <name>' to store the password in the OS keyring.",
+
+  "accounts": [
+    {
+      "name": "work",
+      "default": true,
+
+      "imap": {
+        "host": "imap.work.example.com",
+        "port": 993,
+        "secure": true
+      },
+      "smtp": {
+        "host": "smtp.work.example.com",
+        "port": 587,
+        "secure": false,
+        "starttls": true
+      },
+      "sieve": {
+        "host": "sieve.work.example.com",
+        "port": 4190,
+        "starttls": true
+      },
+
+      "credentials": {
+        "username": "you@work.example.com",
+        "password": ""
+      },
+
+      "user": {
+        "name": "Your Name",
+        "email": "you@work.example.com",
+        "signature": {
+          "enabled": true,
+          "text": "\n\n--\nYour Name\nWork",
+          "html": "<br><br><div style=\"color:#666\">--<br><b>Your Name</b><br>Work</div>"
+        }
+      },
+
+      "folders": {
+        "inbox": "INBOX",
+        "next": "Next",
+        "waiting": "Waiting",
+        "someday": "Someday",
+        "archive": "Archive",
+        "drafts": "Drafts",
+        "sent": "Sent",
+        "trash": "Trash",
+        "spam": "Spam"
+      },
+
+      "cache": {
+        "enabled": true,
+        "ttl_seconds": 300,
+        "db_path": "~/.imap-mcp/work.db",
+        "encrypt": true
+      },
+
+      "spam": {
+        "junk_flag": "$Junk",
+        "not_junk_flag": "$NotJunk"
+      },
+
+      "auto_archive": {
+        "enabled": true,
+        "senders_file": "auto_archive_work.json"
+      }
+    },
+
+    {
+      "name": "personal",
+
+      "imap": {
+        "host": "imap.personal.example.com",
+        "port": 993,
+        "secure": true
+      },
+      "smtp": {
+        "host": "smtp.personal.example.com",
+        "port": 465,
+        "secure": true
+      },
+
+      "credentials": {
+        "username": "you@personal.example.com",
+        "password": ""
+      },
+
+      "user": {
+        "name": "Your Name",
+        "email": "you@personal.example.com"
+      },
+
+      "folders": {
+        "inbox": "INBOX",
+        "drafts": "Drafts",
+        "sent": "Sent",
+        "trash": "Trash",
+        "spam": "Spam",
+        "archive": "Archive"
+      },
+
+      "cache": {
+        "enabled": false,
+        "db_path": "~/.imap-mcp/personal.db",
+        "encrypt": false
+      }
     }
-  },
-  "folders": {
-    "inbox": "INBOX",
-    "next": "Next",
-    "waiting": "Waiting",
-    "someday": "Someday",
-    "archive": "Archive",
-    "drafts": "Drafts",
-    "sent": "Sent",
-    "trash": "Trash"
-  },
-  "cache": {
-    "enabled": true,
-    "ttl_seconds": 300,
-    "db_path": "~/.imap-mcp/cache.db",
-    "encrypt": false
-  },
-  "auto_archive": {
-    "enabled": true,
-    "senders_file": "auto_archive_senders.json"
-  }
+  ]
 }

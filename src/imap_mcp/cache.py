@@ -24,7 +24,7 @@ import keyring
 from cryptography.fernet import Fernet
 
 _KEYRING_SERVICE = "imap-mcp-cache"
-_KEYRING_USERNAME = "encryption-key"
+_KEYRING_USERNAME_DEFAULT = "encryption-key"
 
 
 _SCHEMA = """
@@ -69,6 +69,16 @@ CREATE INDEX IF NOT EXISTS idx_emails_date ON emails(mailbox, date);
 CREATE INDEX IF NOT EXISTS idx_emails_from ON emails(mailbox, from_email);
 CREATE INDEX IF NOT EXISTS idx_emails_subject ON emails(mailbox, subject);
 CREATE INDEX IF NOT EXISTS idx_emails_message_id ON emails(message_id);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS emails_fts USING fts5(
+    mailbox UNINDEXED,
+    uid UNINDEXED,
+    subject,
+    body,
+    from_address,
+    to_address,
+    tokenize = 'unicode61 remove_diacritics 2'
+);
 """
 
 
@@ -80,16 +90,22 @@ class EmailCache:
     key is managed automatically via the OS keyring.
     """
 
-    def __init__(self, db_path: str = "~/.imap-mcp/cache.db", encrypted: bool = True):
+    def __init__(
+        self,
+        db_path: str = "~/.imap-mcp/cache.db",
+        encrypted: bool = True,
+        keyring_username: str = _KEYRING_USERNAME_DEFAULT,
+    ):
         expanded = os.path.expanduser(db_path)
         Path(expanded).parent.mkdir(parents=True, exist_ok=True)
         self.encrypted = encrypted
+        self.keyring_username = keyring_username
         self._writes_since_flush = 0
         self._flush_interval = 50  # auto-flush every N writes
 
         if encrypted:
             self.db_path = expanded + ".enc"
-            self._fernet = self._get_or_create_fernet()
+            self._fernet = self._get_or_create_fernet(keyring_username)
             self.conn = self._open_encrypted()
         else:
             self.db_path = expanded
@@ -108,12 +124,17 @@ class EmailCache:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _get_or_create_fernet() -> Fernet:
-        """Retrieve or generate the Fernet encryption key from the OS keyring."""
-        key = keyring.get_password(_KEYRING_SERVICE, _KEYRING_USERNAME)
+    def _get_or_create_fernet(keyring_username: str = _KEYRING_USERNAME_DEFAULT) -> Fernet:
+        """Retrieve or generate the Fernet encryption key from the OS keyring.
+
+        Each account uses its own ``keyring_username`` so caches stay
+        independently encrypted -- losing or rotating one account's key
+        does not affect any other account.
+        """
+        key = keyring.get_password(_KEYRING_SERVICE, keyring_username)
         if key is None:
             key = Fernet.generate_key().decode()
-            keyring.set_password(_KEYRING_SERVICE, _KEYRING_USERNAME, key)
+            keyring.set_password(_KEYRING_SERVICE, keyring_username, key)
         return Fernet(key.encode() if isinstance(key, str) else key)
 
     def _open_encrypted(self) -> sqlite3.Connection:
@@ -207,6 +228,7 @@ class EmailCache:
         if row["uidvalidity"] != uidvalidity:
             self.conn.execute("DELETE FROM attachments WHERE mailbox = ?", (mailbox,))
             self.conn.execute("DELETE FROM emails WHERE mailbox = ?", (mailbox,))
+            self.conn.execute("DELETE FROM emails_fts WHERE mailbox = ?", (mailbox,))
             self.conn.execute(
                 "UPDATE mailbox_meta SET uidvalidity = ?, last_sync = NULL WHERE mailbox = ?",
                 (uidvalidity, mailbox),
@@ -297,6 +319,105 @@ class EmailCache:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    # ------------------------------------------------------------------
+    # Full-text search (SQLite FTS5)
+    # ------------------------------------------------------------------
+
+    def index_email_fts(
+        self,
+        mailbox: str,
+        uid: int,
+        subject: Optional[str],
+        body_text: Optional[str],
+        from_email: Optional[str],
+        from_name: Optional[str],
+        to_addresses: Optional[list],
+    ) -> None:
+        """Insert or replace the FTS row for an email.
+
+        Called automatically by ``store_email`` when a body is present.
+        """
+        to_str = " ".join(
+            (a.get("email", "") + " " + (a.get("name") or ""))
+            if isinstance(a, dict)
+            else (getattr(a, "email", "") + " " + (getattr(a, "name", None) or ""))
+            for a in (to_addresses or [])
+        )
+        from_str = (from_email or "") + " " + (from_name or "")
+        # Ensure idempotent insert (FTS5 doesn't support ON CONFLICT).
+        self.conn.execute(
+            "DELETE FROM emails_fts WHERE mailbox = ? AND uid = ?", (mailbox, uid)
+        )
+        self.conn.execute(
+            "INSERT INTO emails_fts (mailbox, uid, subject, body, from_address, to_address) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (mailbox, uid, subject or "", body_text or "", from_str, to_str),
+        )
+
+    def fts_search(
+        self,
+        query: str,
+        mailbox: Optional[str] = None,
+        limit: int = 50,
+    ) -> list[dict]:
+        """Run an FTS5 MATCH query, returning email rows joined with metadata."""
+        if mailbox:
+            sql = (
+                "SELECT e.* FROM emails_fts f "
+                "JOIN emails e ON e.mailbox = f.mailbox AND e.uid = f.uid "
+                "WHERE emails_fts MATCH ? AND f.mailbox = ? "
+                "ORDER BY rank LIMIT ?"
+            )
+            rows = self.conn.execute(sql, (query, mailbox, limit)).fetchall()
+        else:
+            sql = (
+                "SELECT e.* FROM emails_fts f "
+                "JOIN emails e ON e.mailbox = f.mailbox AND e.uid = f.uid "
+                "WHERE emails_fts MATCH ? "
+                "ORDER BY rank LIMIT ?"
+            )
+            rows = self.conn.execute(sql, (query, limit)).fetchall()
+        return [dict(r) for r in rows]
+
+    def fts_count(self, mailbox: Optional[str] = None) -> int:
+        """Return number of rows currently indexed in the FTS table."""
+        if mailbox:
+            row = self.conn.execute(
+                "SELECT COUNT(*) AS c FROM emails_fts WHERE mailbox = ?", (mailbox,)
+            ).fetchone()
+        else:
+            row = self.conn.execute("SELECT COUNT(*) AS c FROM emails_fts").fetchone()
+        return row["c"]
+
+    def rebuild_fts(self, mailbox: Optional[str] = None) -> int:
+        """Rebuild the FTS index from cached emails. Returns rows indexed."""
+        if mailbox:
+            self.conn.execute("DELETE FROM emails_fts WHERE mailbox = ?", (mailbox,))
+            rows = self.conn.execute(
+                "SELECT mailbox, uid, subject, body_text, from_email, from_name, to_json "
+                "FROM emails WHERE mailbox = ? AND has_body = 1", (mailbox,)
+            ).fetchall()
+        else:
+            self.conn.execute("DELETE FROM emails_fts")
+            rows = self.conn.execute(
+                "SELECT mailbox, uid, subject, body_text, from_email, from_name, to_json "
+                "FROM emails WHERE has_body = 1"
+            ).fetchall()
+        count = 0
+        for r in rows:
+            try:
+                to_addrs = json.loads(r["to_json"]) if r["to_json"] else []
+            except (TypeError, ValueError):
+                to_addrs = []
+            self.index_email_fts(
+                r["mailbox"], r["uid"], r["subject"], r["body_text"],
+                r["from_email"], r["from_name"], to_addrs,
+            )
+            count += 1
+        self.conn.commit()
+        self._auto_flush()
+        return count
+
     def get_cached_uids(self, mailbox: str) -> set[int]:
         """Return the set of all cached UIDs for *mailbox*."""
         rows = self.conn.execute(
@@ -362,6 +483,15 @@ class EmailCache:
 
         now = datetime.now().isoformat()
 
+        from_email_val = (
+            from_addr.get("email") if isinstance(from_addr, dict)
+            else getattr(from_addr, "email", None)
+        )
+        from_name_val = (
+            from_addr.get("name") if isinstance(from_addr, dict)
+            else getattr(from_addr, "name", None)
+        )
+
         self.conn.execute(
             """INSERT INTO emails
                (mailbox, uid, message_id, subject, from_email, from_name,
@@ -379,8 +509,8 @@ class EmailCache:
                 mailbox, uid,
                 header.get("message_id"),
                 header.get("subject"),
-                from_addr.get("email") if isinstance(from_addr, dict) else getattr(from_addr, "email", None),
-                from_addr.get("name") if isinstance(from_addr, dict) else getattr(from_addr, "name", None),
+                from_email_val,
+                from_name_val,
                 json.dumps([self._addr_to_dict(a) for a in to_addrs], ensure_ascii=False),
                 json.dumps([self._addr_to_dict(a) for a in cc_addrs], ensure_ascii=False),
                 date,
@@ -389,6 +519,16 @@ class EmailCache:
                 body_text, body_html, has_body, now,
             ),
         )
+
+        # Keep FTS index in sync — only when a body is present (no point
+        # indexing header-only rows).
+        if has_body:
+            self.index_email_fts(
+                mailbox, uid, header.get("subject"), body_text,
+                from_email_val, from_name_val,
+                [self._addr_to_dict(a) for a in to_addrs],
+            )
+
         self.conn.commit()
         self._auto_flush()
 

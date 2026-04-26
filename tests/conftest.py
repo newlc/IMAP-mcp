@@ -190,6 +190,7 @@ def imap_wrapper(mock_imap_client):
     wrapper = ImapClientWrapper()
     wrapper.client = mock_imap_client
     wrapper.current_mailbox = "INBOX"
+    wrapper.account_name = "default"
     wrapper.config = {
         "imap": {"host": "imap.example.com", "port": 993, "secure": True},
         "smtp": {"host": "smtp.example.com", "port": 587, "secure": False, "starttls": True},
@@ -202,6 +203,7 @@ def imap_wrapper(mock_imap_client):
             "archive": "Archive",
             "sent": "Sent",
             "trash": "Trash",
+            "spam": "Spam",
         },
         "auto_archive": {"enabled": False},
         "cache": {"enabled": False, "db_path": "/tmp/test-imap-cache.db", "encrypt": False},
@@ -216,6 +218,22 @@ def imap_wrapper(mock_imap_client):
         },
     }
     return wrapper
+
+
+@pytest.fixture
+def single_account_manager(imap_wrapper):
+    """An AccountManager pre-loaded with the default test account.
+
+    Useful for server-level tests that route through the manager.
+    """
+    from imap_mcp.accounts import Account, AccountManager
+    mgr = AccountManager()
+    acct = Account("default", imap_wrapper.config)
+    acct.client = imap_wrapper
+    acct._connected = True
+    mgr.accounts["default"] = acct
+    mgr.default_name = "default"
+    return mgr
 
 
 @pytest.fixture

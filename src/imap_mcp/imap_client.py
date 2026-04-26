@@ -10,6 +10,7 @@ import email
 import email.header
 import email.utils
 import json
+import logging
 import mimetypes
 import shutil
 import smtplib
@@ -27,6 +28,8 @@ from typing import Optional
 import keyring
 from imapclient import IMAPClient
 
+logger_imap = logging.getLogger(__name__)
+
 from .models import (
     EmailAddress,
     EmailHeader,
@@ -38,7 +41,7 @@ from .models import (
     AutoArchiveSender,
 )
 from .cache import EmailCache
-from .watcher import ImapWatcher, get_watcher
+from .watcher import ImapWatcher
 
 KEYRING_SERVICE = "imap-mcp"
 
@@ -62,11 +65,18 @@ def delete_stored_password(username: str) -> None:
 
 
 class ImapClientWrapper:
-    """Wrapper around IMAPClient for MCP operations."""
+    """Wrapper around IMAPClient for MCP operations.
+
+    Each instance represents one email account. In multi-account mode the
+    :class:`~imap_mcp.accounts.Account` owning this wrapper sets ``config``
+    directly and calls :meth:`_connect_with_loaded_config` instead of
+    :meth:`auto_connect`.
+    """
 
     def __init__(self):
         self.client: Optional[IMAPClient] = None
         self.config: dict = {}
+        self.account_name: Optional[str] = None
         self.current_mailbox: Optional[str] = None
         self.cache: dict = {}
         self.cache_timestamps: dict = {}
@@ -129,6 +139,15 @@ class ImapClientWrapper:
         """
         self.load_config(config_path)
         self.config["_config_path"] = config_path  # Store for watcher
+        return self._connect_with_loaded_config()
+
+    def _connect_with_loaded_config(self) -> bool:
+        """Open the IMAP connection using ``self.config``.
+
+        Used by :class:`~imap_mcp.accounts.Account` (multi-account mode)
+        which sets ``self.config`` directly without going through
+        :meth:`load_config`.
+        """
         imap_config = self.config.get("imap", {})
         creds = self.config.get("credentials", {})
 
@@ -151,15 +170,24 @@ class ImapClientWrapper:
         self.authenticate(username, password)
         self._load_auto_archive_config()
 
-        # Initialize persistent SQLite cache
         cache_config = self.config.get("cache", {})
         db_path = cache_config.get("db_path", "~/.imap-mcp/cache.db")
         encrypt = cache_config.get("encrypt", False)
-        self.email_cache = EmailCache(db_path, encrypted=encrypt)
+        keyring_username = cache_config.get(
+            "keyring_username",
+            f"encryption-key-{self.account_name}" if self.account_name else "encryption-key",
+        )
+        self.email_cache = EmailCache(
+            db_path, encrypted=encrypt, keyring_username=keyring_username
+        )
 
-        # Auto-start watcher if cache is enabled
         if cache_config.get("enabled", True):
-            self.watcher = get_watcher(config_path)
+            # Construct a watcher tied to this account's config dict directly
+            # so multi-account setups don't share a single global watcher.
+            self.watcher = ImapWatcher(
+                config_path=self.config.get("_config_path"),
+                config=self.config,
+            )
             self.watcher.start()
             self.watching = True
 
@@ -249,6 +277,107 @@ class ImapClientWrapper:
             else:
                 raise
         return True
+
+    def rename_mailbox(self, old_name: str, new_name: str) -> dict:
+        """Rename ``old_name`` to ``new_name``."""
+        self._ensure_connected()
+        try:
+            self.client.rename_folder(old_name, new_name)
+            actual_old, actual_new = old_name, new_name
+        except Exception as exc:
+            err = str(exc).lower()
+            if "namespace" in err or "no such" in err or "mailbox" in err:
+                actual_old = old_name if old_name.startswith("INBOX.") else f"INBOX.{old_name}"
+                actual_new = new_name if new_name.startswith("INBOX.") else f"INBOX.{new_name}"
+                self.client.rename_folder(actual_old, actual_new)
+            else:
+                raise
+        return {"renamed": True, "from": actual_old, "to": actual_new}
+
+    def delete_mailbox(self, mailbox: str) -> dict:
+        """Delete a mailbox folder. Server may refuse to delete non-empty folders."""
+        self._ensure_connected()
+        try:
+            self.client.delete_folder(mailbox)
+            actual = mailbox
+        except Exception as exc:
+            err = str(exc).lower()
+            if (
+                ("namespace" in err or "no such" in err or "mailbox" in err)
+                and not mailbox.startswith("INBOX.")
+                and mailbox != "INBOX"
+            ):
+                actual = f"INBOX.{mailbox}"
+                self.client.delete_folder(actual)
+            else:
+                raise
+        return {"deleted": True, "mailbox": actual}
+
+    def empty_mailbox(self, mailbox: str) -> dict:
+        """Delete every message in ``mailbox`` (\\Deleted + EXPUNGE)."""
+        self._ensure_connected()
+        self.select_mailbox(mailbox)
+        uids = self.client.search(["ALL"])
+        if not uids:
+            return {"emptied": True, "mailbox": self.current_mailbox, "deleted_count": 0}
+        self.client.add_flags(uids, [b"\\Deleted"])
+        self.client.expunge()
+        return {
+            "emptied": True,
+            "mailbox": self.current_mailbox,
+            "deleted_count": len(uids),
+        }
+
+    def subscribe_mailbox(self, mailbox: str) -> dict:
+        """Add ``mailbox`` to the subscribed list."""
+        self._ensure_connected()
+        try:
+            self.client.subscribe_folder(mailbox)
+            actual = mailbox
+        except Exception as exc:
+            err = str(exc).lower()
+            if (
+                ("namespace" in err or "no such" in err or "mailbox" in err)
+                and not mailbox.startswith("INBOX.")
+                and mailbox != "INBOX"
+            ):
+                actual = f"INBOX.{mailbox}"
+                self.client.subscribe_folder(actual)
+            else:
+                raise
+        return {"subscribed": True, "mailbox": actual}
+
+    def unsubscribe_mailbox(self, mailbox: str) -> dict:
+        """Remove ``mailbox`` from the subscribed list."""
+        self._ensure_connected()
+        try:
+            self.client.unsubscribe_folder(mailbox)
+            actual = mailbox
+        except Exception as exc:
+            err = str(exc).lower()
+            if (
+                ("namespace" in err or "no such" in err or "mailbox" in err)
+                and not mailbox.startswith("INBOX.")
+                and mailbox != "INBOX"
+            ):
+                actual = f"INBOX.{mailbox}"
+                self.client.unsubscribe_folder(actual)
+            else:
+                raise
+        return {"unsubscribed": True, "mailbox": actual}
+
+    def list_subscribed_mailboxes(self, pattern: str = "*") -> list[MailboxInfo]:
+        """List subscribed mailboxes (matches the IMAP LSUB command)."""
+        self._ensure_connected()
+        folders = self.client.list_sub_folders(pattern=pattern)
+        return [
+            MailboxInfo(
+                name=f[2],
+                delimiter=(f[1].decode() if isinstance(f[1], bytes) else f[1]) or "/",
+                flags=[fl.decode() if isinstance(fl, bytes) else str(fl) for fl in f[0]],
+            )
+            for f in folders
+        ]
 
     @staticmethod
     def _parse_status_value(value) -> int:
@@ -651,30 +780,239 @@ class ImapClientWrapper:
         raise ValueError(f"Attachment at index {attachment_index} not found")
 
     def get_thread(self, uid: int, mailbox: Optional[str] = None) -> list[EmailHeader]:
-        """Get email thread/conversation."""
+        """Get the email thread/conversation that contains ``uid``.
+
+        Resolution order, falling back gracefully:
+
+        1. **IMAP THREAD REFERENCES** -- if the server advertises THREAD
+           support, ask it to compute the thread and return every UID in
+           the same thread group.
+        2. **Local Message-ID / References** -- if the persistent cache has
+           the email's References/In-Reply-To chain, walk it locally.
+        3. **Subject heuristic** -- the original behaviour (search by
+           Re:-stripped subject).
+
+        The result is always sorted by date, oldest first.
+        """
         self._ensure_connected()
         if mailbox:
             self.select_mailbox(mailbox)
 
-        # Get the email to find its references
-        email_data = self.get_email(uid, mailbox)
-        message_id = email_data.header.message_id
-        subject = email_data.header.subject
+        effective_mailbox = mailbox or self.current_mailbox or "INBOX"
 
-        # Search for related emails by subject (simplified thread detection)
+        # --- 1) Try IMAP THREAD REFERENCES ----------------------------------
+        try:
+            caps = {c.upper() for c in self._get_capabilities_set()}
+            if "THREAD=REFERENCES" in caps or "THREAD=ORDEREDSUBJECT" in caps:
+                algo = "REFERENCES" if "THREAD=REFERENCES" in caps else "ORDEREDSUBJECT"
+                try:
+                    threads = self.client.thread(algorithm=algo, criteria=["ALL"])
+                except TypeError:
+                    threads = self.client.thread(algorithm=algo)
+                thread_uids = self._find_uid_in_threads(threads, uid)
+                if thread_uids:
+                    messages = self.client.fetch(
+                        thread_uids, ["ENVELOPE", "FLAGS", "RFC822.SIZE"]
+                    )
+                    headers = [
+                        self._parse_email_header(u, d) for u, d in messages.items()
+                    ]
+                    return sorted(headers, key=lambda h: h.date or datetime.min)
+        except Exception as exc:
+            logger_imap.debug("THREAD REFERENCES unavailable: %s", exc)
+
+        # --- 2) Local Message-ID / References ------------------------------
+        if self.email_cache:
+            related_uids = self._thread_via_local_references(effective_mailbox, uid)
+            if len(related_uids) > 1:
+                messages = self.client.fetch(
+                    sorted(related_uids), ["ENVELOPE", "FLAGS", "RFC822.SIZE"]
+                )
+                headers = [
+                    self._parse_email_header(u, d) for u, d in messages.items()
+                ]
+                return sorted(headers, key=lambda h: h.date or datetime.min)
+
+        # --- 3) Subject heuristic (legacy fallback) -----------------------
+        email_data = self.get_email(uid, mailbox)
+        subject = email_data.header.subject
         if subject:
-            # Remove Re: Fwd: etc. prefixes
             clean_subject = subject
             for prefix in ["Re:", "RE:", "Fwd:", "FWD:", "Fw:", "AW:", "Aw:"]:
                 clean_subject = clean_subject.replace(prefix, "").strip()
-
             uids = self.client.search(["SUBJECT", clean_subject], charset="UTF-8")
             if uids:
                 messages = self.client.fetch(uids, ["ENVELOPE", "FLAGS", "RFC822.SIZE"])
-                headers = [self._parse_email_header(u, d) for u, d in messages.items()]
+                headers = [
+                    self._parse_email_header(u, d) for u, d in messages.items()
+                ]
                 return sorted(headers, key=lambda h: h.date or datetime.min)
 
         return [email_data.header]
+
+    @staticmethod
+    def _find_uid_in_threads(threads, uid: int) -> list[int]:
+        """Return every UID belonging to the same top-level thread as ``uid``.
+
+        IMAPClient returns nested tuples of ints; flatten the group containing
+        the requested uid.
+        """
+        def _flatten(node, acc):
+            if isinstance(node, (list, tuple)):
+                for x in node:
+                    _flatten(x, acc)
+            else:
+                acc.append(int(node))
+            return acc
+
+        for group in threads or []:
+            flat = _flatten(group, [])
+            if uid in flat:
+                return flat
+        return []
+
+    def _thread_via_local_references(
+        self, mailbox: str, uid: int
+    ) -> set[int]:
+        """Walk the cached Message-ID/References graph to assemble a thread."""
+        if not self.email_cache:
+            return {uid}
+
+        # Need the full BODY[HEADER.FIELDS (Message-ID In-Reply-To References)]
+        # but for cached emails we just have message_id. Re-fetch headers for
+        # the seed.
+        try:
+            data = self.client.fetch(
+                [uid],
+                ["BODY.PEEK[HEADER.FIELDS (Message-ID In-Reply-To References)]"],
+            )
+        except Exception:
+            return {uid}
+
+        msg_data = data.get(uid, {})
+        raw_header = msg_data.get(
+            b"BODY[HEADER.FIELDS (Message-ID In-Reply-To References)]", b""
+        )
+        if not raw_header:
+            raw_header = msg_data.get(
+                b"BODY[HEADER.FIELDS (MESSAGE-ID IN-REPLY-TO REFERENCES)]", b""
+            )
+        if not raw_header:
+            return {uid}
+
+        seed = email.message_from_bytes(raw_header)
+        ids: set[str] = set()
+        for h in ("Message-ID", "In-Reply-To"):
+            v = seed.get(h)
+            if v:
+                ids.add(v.strip())
+        for v in (seed.get("References", "") or "").split():
+            ids.add(v.strip())
+
+        if not ids:
+            return {uid}
+
+        placeholders = ", ".join("?" * len(ids))
+        rows = self.email_cache.conn.execute(
+            f"SELECT uid FROM emails WHERE mailbox = ? AND message_id IN ({placeholders})",
+            (mailbox, *ids),
+        ).fetchall()
+        return {uid, *(r["uid"] for r in rows)}
+
+    def _get_capabilities_set(self) -> set[str]:
+        """Return the IMAP server's CAPABILITY set as a set of strings."""
+        if not self.client:
+            return set()
+        caps = self.client.capabilities() or ()
+        return {c.decode() if isinstance(c, bytes) else str(c) for c in caps}
+
+    # === Server metadata =================================================
+
+    def get_capabilities(self) -> list[str]:
+        """Return the IMAP server's advertised capabilities."""
+        self._ensure_connected()
+        return sorted(self._get_capabilities_set())
+
+    def get_namespace(self) -> dict:
+        """Return the IMAP NAMESPACE result (personal/other/shared)."""
+        self._ensure_connected()
+        try:
+            result = self.client.namespace()
+        except Exception as exc:
+            return {"error": str(exc)}
+
+        def _norm(items):
+            if not items:
+                return []
+            out = []
+            for prefix, delim in items:
+                p = prefix.decode() if isinstance(prefix, bytes) else prefix
+                d = delim.decode() if isinstance(delim, bytes) else delim
+                out.append({"prefix": p, "delimiter": d})
+            return out
+
+        return {
+            "personal": _norm(getattr(result, "personal", None)),
+            "other_users": _norm(getattr(result, "other_users", None)),
+            "shared": _norm(getattr(result, "shared", None)),
+        }
+
+    def get_quota(self, mailbox: Optional[str] = None) -> dict:
+        """Return IMAP QUOTA usage for a mailbox (default: INBOX)."""
+        self._ensure_connected()
+        target = mailbox or "INBOX"
+        try:
+            quotas = self.client.get_quota_root(target)
+        except Exception as exc:
+            return {"error": str(exc), "mailbox": target}
+
+        # IMAPClient returns (quota_roots, quota_resources)
+        if isinstance(quotas, tuple) and len(quotas) == 2:
+            roots, resources = quotas
+        else:
+            roots, resources = [], quotas or []
+
+        roots_out = []
+        for r in roots or []:
+            if hasattr(r, "mailbox"):
+                roots_out.append({
+                    "mailbox": (r.mailbox.decode() if isinstance(r.mailbox, bytes) else r.mailbox),
+                    "quota_root": (r.quota_root.decode() if isinstance(r.quota_root, bytes) else r.quota_root),
+                })
+            else:
+                roots_out.append({"mailbox": str(r)})
+
+        resources_out = []
+        for q in resources or []:
+            if hasattr(q, "resource"):
+                resources_out.append({
+                    "quota_root": (q.quota_root.decode() if isinstance(q.quota_root, bytes) else q.quota_root),
+                    "resource": (q.resource.decode() if isinstance(q.resource, bytes) else q.resource),
+                    "usage": int(q.usage),
+                    "limit": int(q.limit),
+                })
+            else:
+                resources_out.append({"raw": str(q)})
+
+        return {"mailbox": target, "quota_roots": roots_out, "resources": resources_out}
+
+    def get_server_id(self) -> dict:
+        """Return IMAP ID server info (RFC 2971), or {} if unsupported."""
+        self._ensure_connected()
+        try:
+            result = self.client.id_(
+                {"name": "imap-mcp", "version": "1.0.0", "vendor": "newlc"}
+            )
+        except Exception as exc:
+            return {"error": str(exc)}
+        if not result:
+            return {}
+        out = {}
+        for k, v in (result.items() if hasattr(result, "items") else []):
+            key = k.decode() if isinstance(k, bytes) else str(k)
+            val = v.decode() if isinstance(v, bytes) else (None if v is None else str(v))
+            out[key] = val
+        return out
 
     # === Cache helpers ===
 
@@ -1728,6 +2066,362 @@ class ImapClientWrapper:
                 raise
         return {"deleted": len(uids), "permanent": False, "moved_to": moved_to}
 
+    # === Draft management ================================================
+
+    def update_draft(
+        self,
+        uid: int,
+        to: list[str],
+        subject: str,
+        body: str,
+        cc: Optional[list[str]] = None,
+        bcc: Optional[list[str]] = None,
+        html_body: Optional[str] = None,
+        attachments: Optional[list[str]] = None,
+        drafts_folder: str = "Drafts",
+        include_signature: bool = True,
+    ) -> dict:
+        """Replace an existing draft.
+
+        IMAP drafts are immutable, so this APPENDs the new draft and then
+        \\Deleted+EXPUNGEs the original UID. Returns the new UID when the
+        server reports it via APPENDUID, otherwise just confirms the swap.
+        """
+        self._ensure_connected()
+
+        msg = self._build_message(
+            to=to, subject=subject, body=body,
+            cc=cc, bcc=bcc, html_body=html_body,
+            attachments=attachments,
+            include_signature=include_signature,
+            include_bcc_header=True,
+        )
+
+        new_uid: Optional[int] = None
+        try:
+            append_resp = self.client.append(
+                drafts_folder, msg.as_bytes(), flags=[b"\\Draft"]
+            )
+            actual_folder = drafts_folder
+        except Exception as e:
+            err = str(e).lower()
+            if (
+                ("namespace" in err or "no such" in err or "mailbox" in err)
+                and not drafts_folder.startswith("INBOX.")
+                and drafts_folder != "INBOX"
+            ):
+                actual_folder = f"INBOX.{drafts_folder}"
+                append_resp = self.client.append(
+                    actual_folder, msg.as_bytes(), flags=[b"\\Draft"]
+                )
+            else:
+                raise
+
+        # IMAPClient may return the assigned UID via APPENDUID.
+        if isinstance(append_resp, (bytes, str)):
+            try:
+                # Format: "[APPENDUID <uidvalidity> <uid>] (Success)"
+                text = append_resp.decode() if isinstance(append_resp, bytes) else append_resp
+                if "APPENDUID" in text.upper():
+                    parts = text.split()
+                    for i, p in enumerate(parts):
+                        if p.upper().endswith("APPENDUID") and i + 2 < len(parts):
+                            new_uid = int(parts[i + 2].rstrip("]"))
+                            break
+            except (ValueError, AttributeError):
+                pass
+
+        # Delete the old draft.
+        self.select_mailbox(actual_folder)
+        self.client.add_flags([uid], [b"\\Deleted"])
+        self.client.expunge()
+
+        return {
+            "updated": True,
+            "old_uid": uid,
+            "new_uid": new_uid,
+            "drafts_folder": actual_folder,
+        }
+
+    def delete_draft(
+        self, uid: int, drafts_folder: str = "Drafts"
+    ) -> dict:
+        """Permanently remove one draft from the Drafts folder."""
+        self._ensure_connected()
+        try:
+            self.select_mailbox(drafts_folder)
+        except Exception as e:
+            err = str(e).lower()
+            if "namespace" in err or "no such" in err or "mailbox" in err:
+                self.select_mailbox(f"INBOX.{drafts_folder}")
+            else:
+                raise
+        self.client.add_flags([uid], [b"\\Deleted"])
+        self.client.expunge()
+        return {"deleted": True, "uid": uid, "drafts_folder": self.current_mailbox}
+
+    # === Spam ============================================================
+
+    def report_spam(
+        self,
+        uids: list[int],
+        mailbox: Optional[str] = None,
+        spam_folder: Optional[str] = None,
+        flag: Optional[str] = None,
+    ) -> dict:
+        """Mark messages as spam: add the junk flag and move to the Spam folder.
+
+        Folder defaults to ``folders.spam`` (or ``"Spam"``). Junk flag
+        defaults to ``spam.junk_flag`` (or ``"$Junk"``). Either can be
+        disabled by passing an empty string.
+        """
+        self._ensure_connected()
+        if mailbox:
+            self.select_mailbox(mailbox)
+
+        spam_cfg = self.config.get("spam", {})
+        target = spam_folder or self.config.get("folders", {}).get("spam", "Spam")
+        junk_flag = (
+            flag if flag is not None else spam_cfg.get("junk_flag", "$Junk")
+        )
+        not_junk_flag = spam_cfg.get("not_junk_flag", "$NotJunk")
+
+        if junk_flag:
+            try:
+                self.client.add_flags(uids, [junk_flag.encode()])
+            except Exception as exc:
+                logger_imap.debug("Could not add %s flag: %s", junk_flag, exc)
+            if not_junk_flag:
+                try:
+                    self.client.remove_flags(uids, [not_junk_flag.encode()])
+                except Exception:
+                    pass
+
+        try:
+            self.client.move(uids, target)
+            moved_to = target
+        except Exception as exc:
+            if (
+                "namespace" in str(exc).lower()
+                and not target.startswith("INBOX.")
+                and target != "INBOX"
+            ):
+                moved_to = f"INBOX.{target}"
+                self.client.move(uids, moved_to)
+            else:
+                raise
+        return {"reported": len(uids), "moved_to": moved_to, "flag": junk_flag or None}
+
+    def mark_not_spam(
+        self,
+        uids: list[int],
+        mailbox: Optional[str] = None,
+        destination: Optional[str] = None,
+    ) -> dict:
+        """Move messages out of the Spam folder and clear the junk flag."""
+        self._ensure_connected()
+        spam_folder = mailbox or self.config.get("folders", {}).get("spam", "Spam")
+        try:
+            self.select_mailbox(spam_folder)
+        except Exception as exc:
+            err = str(exc).lower()
+            if "namespace" in err or "no such" in err or "mailbox" in err:
+                self.select_mailbox(f"INBOX.{spam_folder}")
+            else:
+                raise
+
+        spam_cfg = self.config.get("spam", {})
+        junk_flag = spam_cfg.get("junk_flag", "$Junk")
+        not_junk_flag = spam_cfg.get("not_junk_flag", "$NotJunk")
+
+        if junk_flag:
+            try:
+                self.client.remove_flags(uids, [junk_flag.encode()])
+            except Exception:
+                pass
+        if not_junk_flag:
+            try:
+                self.client.add_flags(uids, [not_junk_flag.encode()])
+            except Exception:
+                pass
+
+        target = destination or self.config.get("folders", {}).get("inbox", "INBOX")
+        try:
+            self.client.move(uids, target)
+            moved_to = target
+        except Exception as exc:
+            if (
+                "namespace" in str(exc).lower()
+                and not target.startswith("INBOX.")
+                and target != "INBOX"
+            ):
+                moved_to = f"INBOX.{target}"
+                self.client.move(uids, moved_to)
+            else:
+                raise
+        return {"unspammed": len(uids), "moved_to": moved_to}
+
+    # === FTS-aware search ================================================
+
+    def search_emails_fts(
+        self,
+        query: str,
+        mailbox: Optional[str] = None,
+        limit: int = 50,
+    ) -> list[EmailHeader]:
+        """Run an FTS5 query against the local cache.
+
+        Requires that the cache is populated via :meth:`load_cache`. Returns
+        :class:`EmailHeader` items reconstructed from cache rows -- no IMAP
+        round trip.
+        """
+        if not self.email_cache:
+            raise RuntimeError(
+                "Persistent cache is disabled. Set cache.enabled=true and "
+                "load emails with load_cache() before using FTS."
+            )
+        rows = self.email_cache.fts_search(query, mailbox=mailbox, limit=limit)
+        return [self._cached_to_header(r) for r in rows]
+
+    def search_advanced(
+        self,
+        query: Optional[str] = None,
+        from_addr: Optional[str] = None,
+        to_addr: Optional[str] = None,
+        subject: Optional[str] = None,
+        since: Optional[str] = None,
+        before: Optional[str] = None,
+        has_attachments: Optional[bool] = None,
+        unread: Optional[bool] = None,
+        flagged: Optional[bool] = None,
+        mailbox: Optional[str] = None,
+        use_fts: bool = False,
+        limit: int = 50,
+    ) -> list[EmailHeader]:
+        """Combine multiple IMAP SEARCH criteria in a single call.
+
+        With ``use_fts=True`` (or when there's no IMAP connection but the
+        cache is available), the body part of ``query`` is matched via FTS5
+        and the structured criteria are applied as a post-filter on results.
+
+        Otherwise uses the IMAP server's SEARCH with combined criteria.
+        """
+        if use_fts:
+            if not query:
+                raise ValueError("FTS mode requires 'query'")
+            results = self.search_emails_fts(query, mailbox=mailbox, limit=max(limit * 4, limit))
+            # Apply structured filters in Python
+            def _match(h: EmailHeader) -> bool:
+                if from_addr:
+                    fa = h.from_address
+                    haystack = ((fa.email if fa else "") + " " + (fa.name or "" if fa else "")).lower()
+                    if from_addr.lower() not in haystack:
+                        return False
+                if subject and (subject.lower() not in (h.subject or "").lower()):
+                    return False
+                if to_addr:
+                    addrs = " ".join(a.email + " " + (a.name or "") for a in h.to_addresses).lower()
+                    if to_addr.lower() not in addrs:
+                        return False
+                return True
+            return [h for h in results if _match(h)][:limit]
+
+        self._ensure_connected()
+        if mailbox:
+            self.select_mailbox(mailbox)
+        elif not self.current_mailbox:
+            self.select_mailbox("INBOX")
+
+        criteria: list = []
+        if unread is True:
+            criteria.append("UNSEEN")
+        elif unread is False:
+            criteria.append("SEEN")
+        if flagged is True:
+            criteria.append("FLAGGED")
+        elif flagged is False:
+            criteria.append("UNFLAGGED")
+        if from_addr:
+            criteria.extend(["FROM", from_addr])
+        if to_addr:
+            criteria.extend(["TO", to_addr])
+        if subject:
+            criteria.extend(["SUBJECT", subject])
+        if query:
+            criteria.extend(["TEXT", query])
+        if since:
+            criteria.extend(["SINCE", self._to_imap_date(since)])
+        if before:
+            criteria.extend(["BEFORE", self._to_imap_date(before)])
+
+        if not criteria:
+            criteria = ["ALL"]
+
+        try:
+            uids = self.client.search(criteria, charset="UTF-8")
+        except Exception:
+            uids = self.client.search(criteria)
+
+        if has_attachments is not None:
+            # Filter via BODYSTRUCTURE (cheap-ish)
+            uids_to_check = sorted(uids, reverse=True)[:limit * 4]
+            keep = []
+            if uids_to_check:
+                msgs = self.client.fetch(uids_to_check, ["BODYSTRUCTURE"])
+                for u, d in msgs.items():
+                    bs = d.get(b"BODYSTRUCTURE")
+                    has = self._bodystructure_has_attachment(bs)
+                    if has == has_attachments:
+                        keep.append(u)
+            uids = keep
+
+        uids = sorted(uids, reverse=True)[:limit]
+        if not uids:
+            return []
+        messages = self.client.fetch(uids, ["ENVELOPE", "FLAGS", "RFC822.SIZE"])
+        return [self._parse_email_header(uid, data) for uid, data in messages.items()]
+
+    @staticmethod
+    def _bodystructure_has_attachment(bs) -> bool:
+        """Best-effort check whether a BODYSTRUCTURE indicates attachments."""
+        if bs is None:
+            return False
+        # Multipart: a tuple where the first element is itself a tuple/list
+        try:
+            if isinstance(bs, (list, tuple)) and bs and isinstance(bs[0], (list, tuple)):
+                # Walk children
+                for child in bs:
+                    if isinstance(child, (list, tuple)) and child and isinstance(child[0], (list, tuple)):
+                        if ImapClientWrapper._bodystructure_has_attachment(child):
+                            return True
+                    elif isinstance(child, (list, tuple)):
+                        # Leaf part: check Content-Disposition slot
+                        disposition_slot = child[8] if len(child) > 8 else None
+                        if disposition_slot and isinstance(disposition_slot, (list, tuple)):
+                            disp = disposition_slot[0]
+                            disp = disp.decode() if isinstance(disp, bytes) else (disp or "")
+                            if "attachment" in disp.lower():
+                                return True
+                return False
+            # Singlepart leaf
+            if isinstance(bs, (list, tuple)) and len(bs) > 8:
+                disposition_slot = bs[8]
+                if disposition_slot and isinstance(disposition_slot, (list, tuple)):
+                    disp = disposition_slot[0]
+                    disp = disp.decode() if isinstance(disp, bytes) else (disp or "")
+                    if "attachment" in disp.lower():
+                        return True
+        except Exception:
+            return False
+        return False
+
+    def rebuild_search_index(self, mailbox: Optional[str] = None) -> dict:
+        """Rebuild the FTS5 index from the persistent cache."""
+        if not self.email_cache:
+            raise RuntimeError("Persistent cache is disabled.")
+        count = self.email_cache.rebuild_fts(mailbox=mailbox)
+        return {"indexed": count, "mailbox": mailbox or "<all>"}
+
     # === Statistics ===
 
     def get_unread_count(self, mailbox: str = "INBOX") -> int:
@@ -1832,9 +2526,10 @@ class ImapClientWrapper:
     def start_watch(self) -> bool:
         """Start permanent IDLE watch on INBOX, next, waiting, someday."""
         if not self.watcher:
-            config_path = Path(self.config.get("_config_path", "config.json"))
-            self.watcher = get_watcher(str(config_path))
-
+            self.watcher = ImapWatcher(
+                config_path=self.config.get("_config_path"),
+                config=self.config,
+            )
         self.watcher.start()
         self.watching = True
         return True

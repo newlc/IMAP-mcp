@@ -329,9 +329,16 @@ class TestForwardEmail:
 
 
 class TestWriteModeGating:
-    def teardown_method(self, method):
-        # Always restore default (read-only) so other tests aren't affected.
+    def setup_method(self, method):
+        # Reset module state so tests don't bleed into one another.
         srv._write_enabled = False
+        srv.account_manager.accounts.clear()
+        srv.account_manager.default_name = None
+
+    def teardown_method(self, method):
+        srv._write_enabled = False
+        srv.account_manager.accounts.clear()
+        srv.account_manager.default_name = None
 
     def test_list_tools_excludes_write_tools_by_default(self):
         srv._write_enabled = False
@@ -341,17 +348,41 @@ class TestWriteModeGating:
         assert "reply_email" not in names
         assert "forward_email" not in names
         assert "delete_email" not in names
+        assert "rename_mailbox" not in names
+        assert "delete_mailbox" not in names
+        assert "empty_mailbox" not in names
+        assert "sieve_put_script" not in names
         # Read-only tools still present
         assert "fetch_emails" in names
         assert "save_draft" in names
         assert "move_email" in names
         assert "archive_email" in names
+        assert "search_emails_fts" in names
+        assert "report_spam" in names
+        assert "get_capabilities" in names
+        assert "list_accounts" in names
 
     def test_list_tools_includes_write_tools_when_enabled(self):
         srv._write_enabled = True
         tools = asyncio.run(srv.list_tools())
         names = {t.name for t in tools}
-        assert {"send_email", "reply_email", "forward_email", "delete_email"} <= names
+        assert {
+            "send_email", "reply_email", "forward_email", "delete_email",
+            "rename_mailbox", "delete_mailbox", "empty_mailbox",
+            "sieve_put_script", "sieve_delete_script", "sieve_activate_script",
+        } <= names
+
+    def test_every_tool_advertises_account_param(self):
+        srv._write_enabled = True
+        tools = asyncio.run(srv.list_tools())
+        global_tools = {"auto_connect", "list_accounts", "disconnect"}
+        for t in tools:
+            if t.name in global_tools:
+                continue
+            props = t.inputSchema.get("properties", {})
+            assert "account" in props, (
+                f"Tool {t.name!r} does not advertise an 'account' parameter"
+            )
 
     def test_write_tool_call_blocked_when_disabled(self):
         srv._write_enabled = False
@@ -366,15 +397,18 @@ class TestWriteModeGating:
         assert len(result) == 1
         assert "read-only" in result[0].text
 
-    def test_write_tool_call_proceeds_when_enabled(self, monkeypatch):
+    def test_write_tool_call_proceeds_when_enabled(self, single_account_manager):
         srv._write_enabled = True
+        srv.account_manager.accounts.update(single_account_manager.accounts)
+        srv.account_manager.default_name = single_account_manager.default_name
+
         called = {}
 
         def fake_send_email(**kwargs):
             called.update(kwargs)
             return {"sent": True, "message_id": "<x@y>", "saved_to_sent": "Sent"}
 
-        monkeypatch.setattr(srv.imap_client, "send_email", fake_send_email)
+        single_account_manager.get(None).send_email = fake_send_email
         result = asyncio.run(srv.handle_tool_call("send_email", {
             "to": ["x@example.com"], "subject": "s", "body": "b",
         }))
