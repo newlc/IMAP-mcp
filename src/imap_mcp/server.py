@@ -10,7 +10,16 @@ from typing import Any, Optional
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import Tool, TextContent
+from mcp.types import (
+    GetPromptResult,
+    Prompt,
+    PromptArgument,
+    PromptMessage,
+    Resource,
+    ResourceTemplate,
+    TextContent,
+    Tool,
+)
 
 from .accounts import AccountManager
 
@@ -40,6 +49,7 @@ WRITE_TOOL_NAMES = frozenset({
     "sieve_put_script",
     "sieve_delete_script",
     "sieve_activate_script",
+    "rotate_encryption_key",
 })
 
 # Create MCP server
@@ -521,6 +531,22 @@ async def list_tools() -> list[Tool]:
             "Get persistent cache statistics (emails cached, attachments, database size)",
             {},
         ),
+        make_tool(
+            "cleanup_sent_log",
+            "Delete sent_log rows older than N days. Returns counts.",
+            {
+                "older_than_days": {
+                    "type": "number",
+                    "description": "Cutoff in days (default: 30; 0 deletes everything)",
+                },
+            },
+        ),
+        make_tool(
+            "vacuum_cache",
+            "Compact the cache database (VACUUM + FTS5 optimize) and report "
+            "size before/after.",
+            {},
+        ),
         # === Auto-Archive ===
         make_tool(
             "get_auto_archive_list",
@@ -951,6 +977,13 @@ async def list_tools() -> list[Tool]:
             {"name": {"type": "string", "description": "Script name (empty = none active)"}},
             ["name"],
         ),
+        make_tool(
+            "rotate_encryption_key",
+            "Generate a fresh Fernet key for the encrypted cache and re-encrypt "
+            "the on-disk snapshot with it. The previous key is backed up to "
+            "OS keyring under '<keyring_username>.previous'. Requires --write.",
+            {},
+        ),
     ]
 
     if _write_enabled:
@@ -1365,6 +1398,14 @@ async def handle_tool_call(name: str, args: dict) -> Any:
         )
     elif name == "get_cache_stats":
         return cli.get_cache_stats()
+    elif name == "cleanup_sent_log":
+        return cli.cleanup_sent_log(
+            older_than_days=int(args.get("older_than_days", 30))
+        )
+    elif name == "vacuum_cache":
+        return cli.vacuum_cache()
+    elif name == "rotate_encryption_key":
+        return cli.rotate_encryption_key()
 
     # ------------------------------------------------------------------
     # Server metadata
@@ -1426,6 +1467,309 @@ async def handle_tool_call(name: str, args: dict) -> Any:
 
     else:
         raise ValueError(f"Unknown tool: {name}")
+
+
+# ============================================================================
+# MCP resources
+#
+# We expose three URI shapes per account:
+#
+#   imap://{account}/overview          -- inbox-style summary as text/markdown
+#   imap://{account}/{mailbox}/{uid}   -- one email rendered as text
+#   imap://{account}/health            -- per-account health snapshot
+#
+# Static resources (one ``overview`` and one ``health`` per configured
+# account) are listed via ``list_resources``. Per-message URLs are declared
+# via ``list_resource_templates`` so MCP clients know the URI shape and can
+# request anything matching it.
+# ============================================================================
+
+
+def _account_overview_resources() -> list[Resource]:
+    out: list[Resource] = []
+    for acct in account_manager.accounts.values():
+        out.append(Resource(
+            name=f"{acct.name}: inbox overview",
+            uri=f"imap://{acct.name}/overview",
+            mimeType="text/markdown",
+            description=(
+                f"Recent unread/flagged summary for {acct.name} "
+                f"(populated from cache when available)."
+            ),
+        ))
+        out.append(Resource(
+            name=f"{acct.name}: health",
+            uri=f"imap://{acct.name}/health",
+            mimeType="application/json",
+            description=f"Per-account NOOP + cache/watcher health for {acct.name}.",
+        ))
+    return out
+
+
+@server.list_resources()
+async def list_resources() -> list[Resource]:
+    if not account_manager.has_accounts():
+        return []
+    return _account_overview_resources()
+
+
+@server.list_resource_templates()
+async def list_resource_templates() -> list[ResourceTemplate]:
+    return [
+        ResourceTemplate(
+            name="Single email",
+            uriTemplate="imap://{account}/{mailbox}/{uid}",
+            description=(
+                "Read one email by UID. Returns headers + plain-text body "
+                "(HTML emails are converted via html2text)."
+            ),
+            mimeType="text/markdown",
+        ),
+        ResourceTemplate(
+            name="Mailbox summary",
+            uriTemplate="imap://{account}/{mailbox}/summary",
+            description=(
+                "Compact summary list (subject/from/date/snippet) of the "
+                "20 most recent UIDs in a mailbox."
+            ),
+            mimeType="text/markdown",
+        ),
+    ]
+
+
+def _parse_imap_uri(uri: str) -> tuple[str, list[str]]:
+    """Return ``(account, [parts...])`` for an imap:// URI.
+
+    ``imap://work/INBOX/4231``      -> ("work", ["INBOX", "4231"])
+    ``imap://work/INBOX/summary``   -> ("work", ["INBOX", "summary"])
+    ``imap://work/overview``        -> ("work", ["overview"])
+    """
+    if not uri.startswith("imap://"):
+        raise ValueError(f"Unsupported URI scheme: {uri!r}")
+    rest = uri[len("imap://"):]
+    if not rest:
+        raise ValueError("Empty IMAP URI")
+    parts = [p for p in rest.split("/") if p]
+    if not parts:
+        raise ValueError(f"Malformed IMAP URI: {uri!r}")
+    return parts[0], parts[1:]
+
+
+def _format_overview(cli) -> str:
+    """Render an inbox overview as compact markdown."""
+    try:
+        unread = cli.search_unread(mailbox="INBOX", limit=20)
+    except Exception as exc:
+        return f"# Inbox overview\n\n_error: {exc}_"
+    lines = [f"# Inbox overview ({len(unread)} unread shown)\n"]
+    for h in unread:
+        sender = (h.from_address.email if h.from_address else "?")
+        date = h.date.isoformat() if h.date else "?"
+        lines.append(f"- **{h.subject or '(no subject)'}** -- {sender} ({date})")
+    return "\n".join(lines)
+
+
+def _format_email(cli, mailbox: str, uid: int) -> str:
+    """Render a single email as markdown."""
+    try:
+        msg = cli.get_email(uid=uid, mailbox=mailbox)
+    except Exception as exc:
+        return f"_error fetching {mailbox}/{uid}: {exc}_"
+    h = msg.header
+    body_text = (msg.body.text if msg.body else "") or ""
+    md = (
+        f"# {h.subject or '(no subject)'}\n\n"
+        f"- **From:** {h.from_address.email if h.from_address else '?'}\n"
+        f"- **To:** {', '.join(a.email for a in h.to_addresses) or '?'}\n"
+        f"- **Date:** {h.date.isoformat() if h.date else '?'}\n"
+        f"- **Flags:** {', '.join(h.flags) or '(none)'}\n"
+        f"- **Attachments:** {len(msg.attachments)}\n\n"
+        f"---\n\n{body_text}"
+    )
+    return md
+
+
+def _format_mailbox_summary(cli, mailbox: str) -> str:
+    """Render a 20-email mailbox summary as markdown."""
+    try:
+        headers = cli.fetch_emails(mailbox=mailbox, limit=20)
+        uids = [h.uid for h in headers]
+        summaries = cli.get_email_summary(uids=uids, mailbox=mailbox, body_chars=200)
+    except Exception as exc:
+        return f"_error: {exc}_"
+    lines = [f"# {mailbox}: {len(summaries)} most recent\n"]
+    for s in summaries:
+        marker = "·" if s.get("unread") else " "
+        lines.append(
+            f"- {marker} **{s.get('subject') or '(no subject)'}** -- "
+            f"{s.get('sender') or '?'} ({s.get('date') or '?'})"
+        )
+        snippet = (s.get("snippet") or "").replace("\n", " ").strip()
+        if snippet:
+            lines.append(f"  > {snippet}")
+    return "\n".join(lines)
+
+
+@server.read_resource()
+async def read_resource(uri):
+    """Resolve an ``imap://...`` URI into renderable text."""
+    uri_str = str(uri)
+    account, parts = _parse_imap_uri(uri_str)
+    cli = _client(account)
+
+    if not parts:
+        raise ValueError(f"Malformed URI: {uri_str!r}")
+
+    # imap://{account}/overview
+    if len(parts) == 1 and parts[0] == "overview":
+        return _format_overview(cli)
+    # imap://{account}/health
+    if len(parts) == 1 and parts[0] == "health":
+        return json.dumps(cli.health_check(), default=str, ensure_ascii=False)
+    # imap://{account}/{mailbox}/summary
+    if len(parts) == 2 and parts[1] == "summary":
+        return _format_mailbox_summary(cli, parts[0])
+    # imap://{account}/{mailbox}/{uid}
+    if len(parts) == 2:
+        mailbox, uid_str = parts
+        try:
+            uid = int(uid_str)
+        except ValueError as exc:
+            raise ValueError(f"Bad UID in URI {uri_str!r}: {exc}")
+        return _format_email(cli, mailbox, uid)
+
+    raise ValueError(f"Unhandled IMAP URI shape: {uri_str!r}")
+
+
+# ============================================================================
+# MCP prompts
+#
+# Pre-baked prompt templates for the most common AI workflows. Each prompt
+# returns a single user-role message; the client substitutes placeholders.
+# ============================================================================
+
+
+_PROMPTS: dict[str, dict] = {
+    "summarize_inbox": {
+        "title": "Summarize unread inbox",
+        "description": "Produce a concise digest of unread emails in INBOX.",
+        "arguments": [
+            PromptArgument(name="account", description="Account name (optional)", required=False),
+            PromptArgument(name="limit", description="Max emails to consider (default 20)", required=False),
+        ],
+        "template": (
+            "Use the imap-mcp tools to summarize the inbox.\n\n"
+            "1. Call `search_unread(account={account}, mailbox=\"INBOX\", limit={limit})`.\n"
+            "2. Call `get_email_summary(account={account}, uids=[...], body_chars=300)` "
+            "with the UIDs from step 1.\n"
+            "3. Group the results by sender domain and produce a 5-10 line "
+            "executive digest. Highlight anything that requires a response."
+        ),
+    },
+    "triage_inbox": {
+        "title": "Triage unread inbox",
+        "description": (
+            "Sort unread emails into action / waiting / archive buckets and "
+            "propose moves (preview only -- ask before mutating)."
+        ),
+        "arguments": [
+            PromptArgument(name="account", description="Account name (optional)", required=False),
+        ],
+        "template": (
+            "Triage the unread inbox for account {account}.\n\n"
+            "1. `search_unread(account={account}, mailbox=\"INBOX\", limit=50)`.\n"
+            "2. `get_email_summary(account={account}, uids=[...])`.\n"
+            "3. For each email, classify: ACTION / WAITING / ARCHIVE / SPAM.\n"
+            "4. For ACTION: list a one-line follow-up.\n"
+            "5. For ARCHIVE/SPAM: propose a `bulk_action(..., dry_run=true)` "
+            "that would move them. **Wait for explicit user approval before "
+            "running the call without dry_run.**"
+        ),
+    },
+    "draft_reply": {
+        "title": "Draft a reply",
+        "description": "Draft (don't send) a reply to a specific UID.",
+        "arguments": [
+            PromptArgument(name="account", description="Account name", required=False),
+            PromptArgument(name="uid", description="Email UID to reply to", required=True),
+            PromptArgument(name="tone", description="Tone (formal/casual/concise)", required=False),
+        ],
+        "template": (
+            "Draft a {tone} reply to UID {uid} on account {account}.\n\n"
+            "1. Read the original via `get_email(account={account}, uid={uid})`.\n"
+            "2. Draft a response addressing every question or action item.\n"
+            "3. Save it via `save_draft(account={account}, to=[<reply-to>], "
+            "subject=\"Re: <orig>\", body=...)`. Do not call `reply_email` -- "
+            "leave it as a draft for the user to review."
+        ),
+    },
+    "extract_action_items": {
+        "title": "Extract action items from an email",
+        "description": "Pull explicit and implicit action items out of one email.",
+        "arguments": [
+            PromptArgument(name="account", description="Account name", required=False),
+            PromptArgument(name="uid", description="Email UID", required=True),
+        ],
+        "template": (
+            "Extract action items from UID {uid} on account {account}.\n\n"
+            "1. `get_email(account={account}, uid={uid})`.\n"
+            "2. List explicit asks (\"please send X by Friday\") and implicit "
+            "ones (deadlines mentioned, blockers raised).\n"
+            "3. For each, suggest the owner and a due date when knowable. "
+            "Return as a markdown checklist."
+        ),
+    },
+    "find_similar_emails": {
+        "title": "Find similar / related emails",
+        "description": "Use FTS5 to find emails related to a topic.",
+        "arguments": [
+            PromptArgument(name="account", description="Account name", required=False),
+            PromptArgument(name="query", description="Free-text query", required=True),
+            PromptArgument(name="limit", description="Max results (default 20)", required=False),
+        ],
+        "template": (
+            "Search the local FTS5 index for {query!r} on account {account}.\n\n"
+            "1. `search_emails_fts(account={account}, query={query!r}, "
+            "limit={limit})`.\n"
+            "2. `get_email_summary(account={account}, uids=[...])` for context.\n"
+            "3. Group results by sender and time, surface the top 5 most "
+            "relevant with one-line context each."
+        ),
+    },
+}
+
+
+@server.list_prompts()
+async def list_prompts() -> list[Prompt]:
+    return [
+        Prompt(
+            name=key,
+            title=p["title"],
+            description=p["description"],
+            arguments=p.get("arguments", []),
+        )
+        for key, p in _PROMPTS.items()
+    ]
+
+
+@server.get_prompt()
+async def get_prompt(name: str, arguments: Optional[dict] = None) -> GetPromptResult:
+    prompt = _PROMPTS.get(name)
+    if prompt is None:
+        raise ValueError(f"Unknown prompt: {name!r}")
+
+    args = dict(arguments or {})
+    args.setdefault("account", account_manager.default_name or "<default>")
+    args.setdefault("limit", 20)
+    args.setdefault("tone", "concise")
+    args.setdefault("uid", "<UID>")
+    args.setdefault("query", "<query>")
+
+    text = prompt["template"].format(**args)
+    return GetPromptResult(
+        description=prompt["description"],
+        messages=[PromptMessage(role="user", content=TextContent(type="text", text=text))],
+    )
 
 
 def _sieve_call(account: Optional[str], fn):

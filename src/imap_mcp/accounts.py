@@ -33,10 +33,20 @@ from __future__ import annotations
 
 import json
 import logging
+import random
+import threading
+import time
 from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+
+# How often, by default, to NOOP the main IMAP socket to keep it alive.
+# IMAP IDLE timeout per RFC 2177 is "no longer than 29 minutes"; many
+# servers also drop non-IDLE idle sockets after ~30 minutes. 20 minutes
+# leaves comfortable margin while not flooding the server.
+KEEPALIVE_INTERVAL_SECS = 20 * 60
 
 # Top-level config keys that look like single-account settings. If any of
 # these are present at the root and "accounts" is missing, we refuse to load
@@ -45,7 +55,14 @@ _LEGACY_TOP_LEVEL_KEYS = {"imap", "smtp", "credentials", "user", "folders"}
 
 
 class Account:
-    """One configured email account: wrapper + per-account state."""
+    """One configured email account: wrapper + per-account state.
+
+    A re-entrant lock guards :meth:`ensure_connected` and :meth:`reconnect`
+    so two concurrent tool calls or a watcher reconnect can't race to open
+    duplicate sockets. A daemon keepalive thread pings the main IMAP
+    socket every ``KEEPALIVE_INTERVAL_SECS`` so the server doesn't drop
+    it after the typical 30-minute idle timeout.
+    """
 
     def __init__(self, name: str, config: dict):
         # Lazily import to avoid circular import (imap_client imports accounts
@@ -58,25 +75,95 @@ class Account:
         self.client.config = config
         self.client.account_name = name
         self._connected = False
+        self._lock = threading.RLock()
+        self._keepalive_thread: Optional[threading.Thread] = None
+        self._keepalive_stop: Optional[threading.Event] = None
 
     def ensure_connected(self):
-        """Open the IMAP socket and initialize cache/watcher on first use."""
-        from .imap_client import ImapClientWrapper  # noqa: F401  (type only)
+        """Open the IMAP socket and initialize cache/watcher on first use.
 
-        if self._connected and self.client.client is not None:
+        Holding ``self._lock`` makes this safe under concurrent callers:
+        the second caller waits until the first finishes the handshake
+        and then reuses the same connection.
+        """
+        with self._lock:
+            if self._connected and self.client.client is not None:
+                return self.client
+            self.client._connect_with_loaded_config()
+            self._connected = True
+            self._start_keepalive()
             return self.client
-        # Use the wrapper's connection helper to do the actual work.
-        self.client._connect_with_loaded_config()
-        self._connected = True
-        return self.client
+
+    def reconnect(self):
+        """Force-close the current socket and reopen a fresh one."""
+        with self._lock:
+            try:
+                self.client.disconnect()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("disconnect() during reconnect failed: %s", exc)
+            self._connected = False
+            return self.ensure_connected()
 
     def disconnect(self) -> None:
-        if not self._connected:
+        with self._lock:
+            self._stop_keepalive()
+            if not self._connected:
+                return
+            try:
+                self.client.disconnect()
+            finally:
+                self._connected = False
+
+    def _start_keepalive(self) -> None:
+        """Spawn the keepalive thread once. No-op if already running."""
+        if self._keepalive_thread and self._keepalive_thread.is_alive():
             return
-        try:
-            self.client.disconnect()
-        finally:
-            self._connected = False
+        self._keepalive_stop = threading.Event()
+        self._keepalive_thread = threading.Thread(
+            target=self._keepalive_loop,
+            name=f"imap-keepalive-{self.name}",
+            daemon=True,
+        )
+        self._keepalive_thread.start()
+
+    def _stop_keepalive(self) -> None:
+        if self._keepalive_stop is not None:
+            self._keepalive_stop.set()
+        self._keepalive_thread = None
+        self._keepalive_stop = None
+
+    def _keepalive_loop(self) -> None:
+        """Send a NOOP every KEEPALIVE_INTERVAL_SECS; reconnect on failure.
+
+        Adds a small jitter on the first wait so multiple accounts started
+        together don't all NOOP at the same instant.
+        """
+        # Initial jitter: 0-30s.
+        first_wait = random.uniform(0, 30)
+        if self._keepalive_stop and self._keepalive_stop.wait(first_wait):
+            return
+        while self._keepalive_stop and not self._keepalive_stop.is_set():
+            try:
+                with self._lock:
+                    if not self._connected or self.client.client is None:
+                        break
+                    self.client.client.noop()
+            except Exception as exc:  # noqa: BLE001
+                logger.info(
+                    "Keepalive NOOP failed for %s (%s); reconnecting.",
+                    self.name, exc,
+                )
+                try:
+                    self.reconnect()
+                except Exception as reconn_exc:
+                    logger.warning(
+                        "Keepalive reconnect failed for %s: %s",
+                        self.name, reconn_exc,
+                    )
+            # Sleep with jitter (±10%) until next NOOP.
+            wait = KEEPALIVE_INTERVAL_SECS * random.uniform(0.9, 1.1)
+            if self._keepalive_stop.wait(wait):
+                return
 
     def info(self) -> dict:
         creds = self.config.get("credentials", {})

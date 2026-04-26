@@ -34,6 +34,11 @@ The local cache turns your mailbox into a queryable database that AI assistants 
 - **Bulk operations by query** -- `bulk_action(action, …)` matches messages by sender/subject/date/unread/flagged in one call and applies mark_read, flag, archive, move, copy, delete, or report_spam
 - **Transient-error retries** -- IMAP connect and SMTP send retry on timeouts and connection drops with exponential backoff
 - **Per-account health check** -- `accounts_health` issues a NOOP per connected account and reports cache state
+- **Per-account locking + connection keepalive** -- two concurrent tool calls can't open duplicate sockets, and a background NOOP every ~20 min stops the IMAP server from dropping the main connection during long agent sessions
+- **Watcher reconnect jitter** -- IDLE watchers stagger their initial connect (0-2 s) and back off with jittered exponential delay so a network flap doesn't trigger a thundering herd
+- **MCP resources** -- accounts and emails are exposed as `imap://{account}/overview`, `imap://{account}/health`, and `imap://{account}/{mailbox}/{uid}` resources, so MCP clients can cite them directly
+- **MCP prompts** -- pre-baked workflow prompts (`summarize_inbox`, `triage_inbox`, `draft_reply`, `extract_action_items`, `find_similar_emails`)
+- **Cache maintenance** -- `cleanup_sent_log` purges old idempotency entries, `vacuum_cache` compacts the database, `rotate_encryption_key` *(--write)* re-encrypts the on-disk snapshot with a fresh Fernet key (with previous key backed up under `<keyring_username>.previous`)
 - **Idempotent send/reply/forward** -- pass an `idempotencyKey` and a retry after a network blip won't re-send the message
 - **Attachment safety** -- `security.max_attachment_size_mb` (default 25 MB) is always enforced; opt-in `security.attachments_allowed_dirs` allowlist blocks prompt-injection from attaching files outside whitelisted folders (symlinks resolved before the check)
 - **HTML-only fallback** -- when an email has no `text/plain` part, the cache, FTS index and snippets are populated from `html2text`-converted HTML
@@ -541,13 +546,16 @@ Use `get_cache_stats` to see how many emails are cached, database size, and encr
 | `stop_watch` | Stop all IDLE watchers |
 | `idle_watch` | Watch a single mailbox temporarily (with timeout) |
 
-### Persistent cache (3 tools)
+### Persistent cache (5 tools, +1 under --write)
 
 | Tool | Description |
 |------|-------------|
 | `sync_emails` | Download emails for a date range into SQLite (incremental) |
 | `load_cache` | Flexible cache loader (recent/new/older/range modes) |
 | `get_cache_stats` | Cache statistics (count, size, encryption status) |
+| `cleanup_sent_log` | Purge `sent_log` rows older than N days (default: 30) |
+| `vacuum_cache` | `VACUUM` + FTS5 `optimize` to compact the database |
+| `rotate_encryption_key` *(--write)* | Re-encrypt the on-disk snapshot with a fresh Fernet key; previous key backed up under `<keyring_username>.previous` |
 
 ### Auto-archive (5 tools)
 
@@ -568,6 +576,29 @@ Use `get_cache_stats` to see how many emails are cached, database size, and encr
 | `get_quota` | IMAP `QUOTA` usage for a mailbox |
 | `get_server_id` | IMAP `ID` server info (RFC 2971) |
 | `accounts_health` *(global)* | Per-account NOOP + cache/watcher status (read-only, no new connections) |
+
+### MCP resources & prompts
+
+In addition to tools, the server exposes the standard MCP `resources` and `prompts` surfaces.
+
+**Resources** (clients can request them with `resources/read`):
+
+| URI | Returns |
+|-----|---------|
+| `imap://{account}/overview` | Markdown summary of unread INBOX |
+| `imap://{account}/health` | JSON health snapshot for the account |
+| `imap://{account}/{mailbox}/{uid}` | Single email rendered as markdown (template) |
+| `imap://{account}/{mailbox}/summary` | 20-email recent summary as markdown (template) |
+
+**Prompts** (clients can offer them via `prompts/list` + `prompts/get`):
+
+| Name | Purpose |
+|------|---------|
+| `summarize_inbox` | Concise digest of unread emails |
+| `triage_inbox` | Classify into action / waiting / archive (with `dry_run` move proposal) |
+| `draft_reply` | Draft (don't send) a reply to a specific UID |
+| `extract_action_items` | Pull explicit/implicit action items from one email |
+| `find_similar_emails` | FTS5 search + summary for a topic |
 
 ### Sieve / server-side rules (3 read tools, +3 under --write)
 

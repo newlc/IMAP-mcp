@@ -641,6 +641,97 @@ class EmailCache:
         self._auto_flush()
 
     # ------------------------------------------------------------------
+    # Maintenance: VACUUM, sent_log cleanup, key rotation
+    # ------------------------------------------------------------------
+
+    def cleanup_sent_log(self, older_than_days: int = 30) -> dict:
+        """Delete ``sent_log`` rows older than ``older_than_days`` days.
+
+        Returns ``{"deleted": N, "remaining": M, "cutoff": "<ISO>"}``.
+        """
+        if older_than_days < 0:
+            raise ValueError("older_than_days must be >= 0")
+        from datetime import timedelta
+        cutoff = (datetime.now() - timedelta(days=older_than_days)).isoformat()
+        cur = self.conn.execute(
+            "DELETE FROM sent_log WHERE sent_at < ?", (cutoff,)
+        )
+        deleted = cur.rowcount
+        remaining = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM sent_log"
+        ).fetchone()["c"]
+        self.conn.commit()
+        self._auto_flush()
+        return {"deleted": int(deleted or 0), "remaining": int(remaining), "cutoff": cutoff}
+
+    def vacuum(self) -> dict:
+        """Compact the database (``VACUUM``) and rebuild the FTS5 index.
+
+        For encrypted caches the in-memory database is vacuumed in place
+        and then flushed to disk; the on-disk encrypted file shrinks
+        accordingly. For plain SQLite caches ``VACUUM`` rewrites the file
+        in place.
+        """
+        size_before = (
+            os.path.getsize(self.db_path) if os.path.exists(self.db_path) else 0
+        )
+        # FTS5 supports an "optimize" command to merge segments before VACUUM.
+        try:
+            self.conn.execute("INSERT INTO emails_fts(emails_fts) VALUES('optimize')")
+        except Exception as exc:
+            logger.debug("FTS5 optimize skipped: %s", exc)
+        self.conn.commit()
+        # VACUUM cannot run inside a transaction; sqlite3 manages transactions
+        # implicitly so commit() above is enough.
+        self.conn.execute("VACUUM")
+        self.conn.commit()
+        if self.encrypted:
+            self.flush()
+        size_after = (
+            os.path.getsize(self.db_path) if os.path.exists(self.db_path) else 0
+        )
+        return {
+            "vacuumed": True,
+            "size_before_bytes": size_before,
+            "size_after_bytes": size_after,
+            "saved_bytes": max(0, size_before - size_after),
+        }
+
+    def rotate_encryption_key(self) -> dict:
+        """Generate a fresh Fernet key, re-encrypt the on-disk snapshot
+        with it, and back up the previous key in the OS keyring.
+
+        Only meaningful when the cache is encrypted. The previous key is
+        kept under ``<keyring_username>.previous`` so that a botched
+        rotation is recoverable manually.
+        """
+        if not self.encrypted:
+            raise RuntimeError(
+                "Cache is not encrypted; nothing to rotate. Set "
+                "cache.encrypt=true on this account first."
+            )
+        old_key = keyring.get_password(_KEYRING_SERVICE, self.keyring_username)
+        if not old_key:
+            raise RuntimeError(
+                f"No existing encryption key found under "
+                f"{_KEYRING_SERVICE!r}/{self.keyring_username!r}."
+            )
+        backup_username = f"{self.keyring_username}.previous"
+        keyring.set_password(_KEYRING_SERVICE, backup_username, old_key)
+
+        new_key = Fernet.generate_key().decode()
+        keyring.set_password(_KEYRING_SERVICE, self.keyring_username, new_key)
+        self._fernet = Fernet(new_key.encode())
+        # Force a flush so the on-disk file is encrypted with the new key.
+        self.flush()
+        return {
+            "rotated": True,
+            "keyring_username": self.keyring_username,
+            "backup_keyring_username": backup_username,
+            "db_path": self.db_path,
+        }
+
+    # ------------------------------------------------------------------
     # Stats
     # ------------------------------------------------------------------
 

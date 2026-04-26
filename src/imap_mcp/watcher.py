@@ -6,6 +6,7 @@ changes and refreshing an in-memory cache when new mail arrives.
 
 import json
 import logging
+import random
 import threading
 import time
 from datetime import datetime
@@ -186,7 +187,16 @@ class ImapWatcher:
             return MailboxCache(name=folder, last_updated=datetime.now())
 
     def _watch_folder(self, key: str, folder: str, stop_event: threading.Event) -> None:
-        """Watch a single folder via IMAP IDLE, refreshing cache on changes."""
+        """Watch a single folder via IMAP IDLE, refreshing cache on changes.
+
+        Connection failures back off with jittered exponential delay so that
+        when the network flaps, watchers across multiple folders/accounts
+        don't all reconnect at the same instant (thundering herd).
+        """
+        # Stagger initial connect so N watchers don't dial out simultaneously.
+        if stop_event.wait(random.uniform(0, 2.0)):
+            return
+        consecutive_errors = 0
         while not stop_event.is_set():
             client = None
             try:
@@ -199,6 +209,8 @@ class ImapWatcher:
                     self.cache[key] = cache
                 if self.on_update:
                     self.on_update(key, cache)
+
+                consecutive_errors = 0
 
                 # IDLE loop
                 while not stop_event.is_set():
@@ -217,8 +229,17 @@ class ImapWatcher:
                             self.on_update(key, cache)
 
             except Exception as e:
-                logger.warning("Watcher error for %s: %s", folder, e)
-                time.sleep(5)  # Wait before reconnect
+                consecutive_errors += 1
+                # Exponential backoff with cap and jitter:
+                # 1st failure ~5-7s, 2nd ~10-14s, ..., capped at 60s.
+                base = min(5 * (2 ** (consecutive_errors - 1)), 60)
+                delay = base * random.uniform(1.0, 1.4)
+                logger.warning(
+                    "Watcher error for %s: %s (retry in %.1fs, attempt %d)",
+                    folder, e, delay, consecutive_errors,
+                )
+                if stop_event.wait(delay):
+                    break
 
             finally:
                 if client:

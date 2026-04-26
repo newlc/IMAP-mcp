@@ -1242,6 +1242,28 @@ class ImapClientWrapper:
             return {"error": "Cache not initialized"}
         return self.email_cache.stats()
 
+    def cleanup_sent_log(self, older_than_days: int = 30) -> dict:
+        """Remove sent_log rows older than ``older_than_days`` days."""
+        if not self.email_cache:
+            raise RuntimeError("Persistent cache is disabled.")
+        return self.email_cache.cleanup_sent_log(older_than_days=older_than_days)
+
+    def vacuum_cache(self) -> dict:
+        """Compact the cache database (VACUUM + FTS5 optimize)."""
+        if not self.email_cache:
+            raise RuntimeError("Persistent cache is disabled.")
+        return self.email_cache.vacuum()
+
+    def rotate_encryption_key(self) -> dict:
+        """Re-encrypt the on-disk cache with a fresh Fernet key.
+
+        Backs up the previous key under ``<keyring_username>.previous`` in
+        the OS keyring so a botched rotation is recoverable.
+        """
+        if not self.email_cache:
+            raise RuntimeError("Persistent cache is disabled.")
+        return self.email_cache.rotate_encryption_key()
+
     def load_cache(
         self,
         mailbox: str = "INBOX",
