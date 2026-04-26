@@ -34,6 +34,11 @@ The local cache turns your mailbox into a queryable database that AI assistants 
 - **Bulk operations by query** -- `bulk_action(action, …)` matches messages by sender/subject/date/unread/flagged in one call and applies mark_read, flag, archive, move, copy, delete, or report_spam
 - **Transient-error retries** -- IMAP connect and SMTP send retry on timeouts and connection drops with exponential backoff
 - **Per-account health check** -- `accounts_health` issues a NOOP per connected account and reports cache state
+- **Idempotent send/reply/forward** -- pass an `idempotencyKey` and a retry after a network blip won't re-send the message
+- **Attachment safety** -- `security.max_attachment_size_mb` (default 25 MB) is always enforced; opt-in `security.attachments_allowed_dirs` allowlist blocks prompt-injection from attaching files outside whitelisted folders (symlinks resolved before the check)
+- **HTML-only fallback** -- when an email has no `text/plain` part, the cache, FTS index and snippets are populated from `html2text`-converted HTML
+- **Partial body fetch** -- `get_email_summary` uses `BODY.PEEK[TEXT]<0.N>` (RFC 3501 partial FETCH) so summarising 100 large emails costs ~100 KiB instead of megabytes
+- **Bulk-action batching & limits** -- `bulk_action` accepts `limit` (cap acted-on UIDs) and `batch_size` (default 1000) so 50 K-element STORE/MOVE commands don't trip server limits
 - **Real threading** -- IMAP `THREAD REFERENCES` with cached `Message-ID`/`References` fallback
 - **Full-text search** -- SQLite FTS5 index over cached subjects, bodies, and addresses; combined IMAP `SEARCH` with multiple criteria
 - **Server metadata** -- `CAPABILITY`, `NAMESPACE`, `QUOTA`, `ID`
@@ -140,6 +145,31 @@ When `cache.encrypt: false`, a plain SQLite file is written to disk with WAL jou
 
 - **UIDVALIDITY tracking**: if the IMAP server reassigns UIDs (mailbox recreation), the cache for that mailbox is automatically purged and rebuilt
 - **Namespace auto-detection**: the server automatically handles IMAP servers that require `INBOX.` prefix for folder names (e.g., Dovecot, Jino)
+
+### Attachment safety
+
+`send_email`, `reply_email`, `forward_email`, and `save_draft` all accept local file paths in `attachments`. To stop a malicious prompt from convincing an AI agent to attach `~/.ssh/id_rsa` or `/etc/passwd`, configure per-account limits under `security`:
+
+```jsonc
+{
+  "name": "work",
+  "security": {
+    "max_attachment_size_mb": 25,                 // default 25; pass 0 to disable
+    "attachments_allowed_dirs": [                 // optional allowlist; if absent, any path goes
+      "~/Documents",
+      "~/Downloads",
+      "/srv/share/outgoing"
+    ]
+  },
+  ...
+}
+```
+
+Symlinks are resolved before the allowlist check, so symlinking from an allowed dir to `~/.ssh` is rejected.
+
+### Send-time idempotency
+
+`send_email` / `reply_email` / `forward_email` accept an `idempotencyKey` argument. When the persistent cache is enabled, the first successful call writes `(key, message_id, recipients, subject, saved_to_sent, sent_at)` to a local `sent_log` table. A retry with the same key (e.g. after a network blip) returns the original result without contacting SMTP again -- no duplicate sends.
 
 ## Installation
 

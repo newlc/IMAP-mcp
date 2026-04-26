@@ -79,6 +79,15 @@ CREATE VIRTUAL TABLE IF NOT EXISTS emails_fts USING fts5(
     to_address,
     tokenize = 'unicode61 remove_diacritics 2'
 );
+
+CREATE TABLE IF NOT EXISTS sent_log (
+    idempotency_key TEXT PRIMARY KEY,
+    message_id      TEXT,
+    recipients      TEXT,
+    subject         TEXT,
+    saved_to_sent   TEXT,
+    sent_at         TEXT NOT NULL
+);
 """
 
 
@@ -589,6 +598,47 @@ class EmailCache:
         if row is None:
             return None
         return row["filename"], row["content_type"], row["data"]
+
+    # ------------------------------------------------------------------
+    # Sent-log (idempotency for send/reply/forward)
+    # ------------------------------------------------------------------
+
+    def lookup_sent(self, idempotency_key: str) -> Optional[dict]:
+        """Return a previously recorded send-result for ``idempotency_key``,
+        or ``None`` if no such key has been seen.
+        """
+        if not idempotency_key:
+            return None
+        row = self.conn.execute(
+            "SELECT * FROM sent_log WHERE idempotency_key = ?",
+            (idempotency_key,),
+        ).fetchone()
+        if row is None:
+            return None
+        return dict(row)
+
+    def record_sent(
+        self,
+        idempotency_key: str,
+        message_id: Optional[str],
+        recipients: list[str],
+        subject: Optional[str],
+        saved_to_sent: Optional[str],
+    ) -> None:
+        """Persist the result of a successful send."""
+        if not idempotency_key:
+            return
+        now = datetime.now().isoformat()
+        self.conn.execute(
+            "INSERT OR REPLACE INTO sent_log "
+            "(idempotency_key, message_id, recipients, subject, saved_to_sent, sent_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (idempotency_key, message_id,
+             json.dumps(recipients, ensure_ascii=False),
+             subject, saved_to_sent, now),
+        )
+        self.conn.commit()
+        self._auto_flush()
 
     # ------------------------------------------------------------------
     # Stats

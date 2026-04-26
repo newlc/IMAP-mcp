@@ -30,6 +30,19 @@ from imapclient import IMAPClient
 
 logger_imap = logging.getLogger(__name__)
 
+
+def _is_inside(child: Path, parent: Path) -> bool:
+    """Return True if ``child`` is the same as or located under ``parent``.
+
+    Both paths must already be resolved (real paths) for the symlink check
+    to be meaningful.
+    """
+    try:
+        child.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
 from .models import (
     EmailAddress,
     EmailHeader,
@@ -43,6 +56,7 @@ from .models import (
 from .cache import EmailCache
 from .mail_utils import (
     extract_inline_images,
+    html_to_plain,
     inline_cid_to_data_uri,
     parse_calendar_invites,
     sanitize_html,
@@ -692,6 +706,11 @@ class ImapClientWrapper:
                     html_body = decoded
                 else:
                     text_body = decoded
+
+        # HTML-only fallback: convert HTML to readable plain text so the cache,
+        # FTS index and snippet generators have searchable content.
+        if not text_body and html_body:
+            text_body = html_to_plain(html_body)
 
         return EmailBody(text=text_body, html=html_body)
 
@@ -1623,6 +1642,7 @@ class ImapClientWrapper:
             body_part = MIMEText(final_body, "plain", "utf-8")
 
         if attachments:
+            self._validate_attachment_paths(attachments)
             msg = MIMEMultipart("mixed")
             msg.attach(body_part)
             for path_str in attachments:
@@ -1671,6 +1691,61 @@ class ImapClientWrapper:
         if references:
             msg["References"] = " ".join(references)
         return msg
+
+    def _validate_attachment_paths(self, attachments: list[str]) -> None:
+        """Validate every attachment path against the security policy.
+
+        Two checks:
+
+        * **Size cap** -- ``security.max_attachment_size_mb`` (default 25 MB
+          per file). Always enforced. Pass ``0`` to disable.
+        * **Allowlist** (opt-in) -- ``security.attachments_allowed_dirs``
+          (list of directories). When set, every resolved real path must
+          live inside one of them, blocking prompt-injection from sneaking
+          ``~/.ssh/id_rsa`` or ``/etc/passwd`` into an outgoing email.
+
+        Symlinks are resolved before the allowlist check so symlinking out
+        of an allowed directory is rejected.
+        """
+        sec = self.config.get("security", {}) or {}
+        max_mb = sec.get("max_attachment_size_mb", 25)
+        max_bytes = int(max_mb) * 1024 * 1024 if max_mb else 0
+
+        allowed_dirs_raw = sec.get("attachments_allowed_dirs")
+        allowed_dirs: list[Path] = []
+        if allowed_dirs_raw:
+            for d in allowed_dirs_raw:
+                try:
+                    allowed_dirs.append(Path(d).expanduser().resolve())
+                except OSError:
+                    pass
+
+        for path_str in attachments:
+            try:
+                path = Path(path_str).expanduser()
+                real = path.resolve(strict=False)
+            except (OSError, RuntimeError) as exc:
+                raise ValueError(f"Invalid attachment path {path_str!r}: {exc}")
+
+            if not real.is_file():
+                raise FileNotFoundError(f"Attachment not found: {real}")
+
+            if max_bytes:
+                size = real.stat().st_size
+                if size > max_bytes:
+                    raise ValueError(
+                        f"Attachment {real.name!r} is {size / 1024 / 1024:.1f} MB; "
+                        f"limit is {max_mb} MB. Increase "
+                        f"security.max_attachment_size_mb or set 0 to disable."
+                    )
+
+            if allowed_dirs:
+                if not any(_is_inside(real, d) for d in allowed_dirs):
+                    raise PermissionError(
+                        f"Attachment {real} is outside the configured "
+                        f"security.attachments_allowed_dirs allowlist. "
+                        f"Allowed: {[str(d) for d in allowed_dirs]}"
+                    )
 
     def _safe_append(
         self, folder: str, msg_bytes: bytes, flags: list[bytes]
@@ -1790,14 +1865,37 @@ class ImapClientWrapper:
         sent_folder: Optional[str] = None,
         in_reply_to: Optional[str] = None,
         references: Optional[list[str]] = None,
+        idempotency_key: Optional[str] = None,
     ) -> dict:
         """Send an email via SMTP, optionally saving a copy to the Sent folder.
 
         Bcc recipients receive the message but are not listed in its headers.
-        Returns a dict with ``sent``, ``message_id``, and ``saved_to_sent``
-        (folder name, or ``None`` if the IMAP append failed or was skipped).
+        Returns a dict with ``sent``, ``message_id``, ``saved_to_sent``
+        (folder name, or ``None`` if the IMAP append failed or was skipped),
+        and ``idempotent_replay`` -- ``True`` when this exact key was already
+        seen and the message was *not* re-sent.
+
+        ``idempotency_key`` (when set together with a persistent cache)
+        guards against duplicate sends if the agent retries a tool call
+        because of a network blip after SMTP has already accepted the
+        message. The first successful send writes ``(key, message_id,
+        recipients, subject, saved_to_sent, sent_at)`` to the local
+        ``sent_log`` table; subsequent calls with the same key return that
+        record without contacting SMTP again.
         """
         self._ensure_connected()
+
+        # ---- Idempotency: short-circuit if we've seen this key before ----
+        if idempotency_key and self.email_cache:
+            previous = self.email_cache.lookup_sent(idempotency_key)
+            if previous:
+                return {
+                    "sent": True,
+                    "message_id": previous.get("message_id"),
+                    "saved_to_sent": previous.get("saved_to_sent"),
+                    "idempotent_replay": True,
+                    "sent_at": previous.get("sent_at"),
+                }
 
         msg = self._build_message(
             to=to,
@@ -1836,10 +1934,27 @@ class ImapClientWrapper:
                 # IMAP server doesn't expose a Sent folder we can write to.
                 saved_to = None
 
+        # Record a successful send so the next call with the same key
+        # short-circuits instead of re-sending.
+        if idempotency_key and self.email_cache:
+            try:
+                self.email_cache.record_sent(
+                    idempotency_key,
+                    msg.get("Message-ID"),
+                    envelope_recipients,
+                    subject,
+                    saved_to,
+                )
+            except Exception as exc:
+                logger_imap.warning(
+                    "send_email succeeded but failed to record sent_log: %s", exc
+                )
+
         return {
             "sent": True,
             "message_id": msg.get("Message-ID"),
             "saved_to_sent": saved_to,
+            "idempotent_replay": False,
         }
 
     @staticmethod
@@ -1866,6 +1981,7 @@ class ImapClientWrapper:
         include_signature: bool = True,
         quote_original: bool = True,
         save_to_sent: bool = True,
+        idempotency_key: Optional[str] = None,
     ) -> dict:
         """Reply to the email with the given UID.
 
@@ -1941,6 +2057,7 @@ class ImapClientWrapper:
             in_reply_to=orig_message_id,
             references=new_references or None,
             save_to_sent=save_to_sent,
+            idempotency_key=idempotency_key,
         )
 
     def forward_email(
@@ -1956,6 +2073,7 @@ class ImapClientWrapper:
         extra_attachments: Optional[list[str]] = None,
         include_signature: bool = True,
         save_to_sent: bool = True,
+        idempotency_key: Optional[str] = None,
     ) -> dict:
         """Forward the email with the given UID to new recipients.
 
@@ -2036,6 +2154,7 @@ class ImapClientWrapper:
                 attachments=attach_paths or None,
                 include_signature=include_signature,
                 save_to_sent=save_to_sent,
+                idempotency_key=idempotency_key,
             )
         finally:
             if tempdir:
@@ -2149,6 +2268,7 @@ class ImapClientWrapper:
         uids: list[int],
         mailbox: Optional[str] = None,
         body_chars: int = 300,
+        peek_bytes: Optional[int] = None,
     ) -> list[dict]:
         """Return a compact summary list for ``uids`` -- cheap LLM-friendly.
 
@@ -2156,6 +2276,12 @@ class ImapClientWrapper:
         and the first ``body_chars`` of the plain-text body. Bodies are
         served from cache when available so a 50-email overview costs zero
         IMAP body fetches the second time around.
+
+        For uncached UIDs, only the first ``peek_bytes`` of the message text
+        are fetched via IMAP partial FETCH (``BODY.PEEK[TEXT]<0.N>``,
+        RFC 3501) -- defaults to ``max(body_chars * 4, 1024)`` so the
+        snippet has enough material even after MIME decoding overhead. Pass
+        ``peek_bytes=0`` to skip the body fetch entirely (only headers).
         """
         self._ensure_connected()
         if mailbox:
@@ -2164,6 +2290,9 @@ class ImapClientWrapper:
 
         if not uids:
             return []
+
+        if peek_bytes is None:
+            peek_bytes = max(body_chars * 4, 1024)
 
         # Split: which uids do we already have cached?
         cached_summaries: dict[int, dict] = {}
@@ -2179,16 +2308,35 @@ class ImapClientWrapper:
             uids_need_body = list(uids)
 
         if uids_need_body:
-            # One round trip with BODYSTRUCTURE so we know who has attachments,
-            # and BODY.PEEK[TEXT] for the plain-text snippet without setting \\Seen.
-            fields = ["ENVELOPE", "FLAGS", "RFC822.SIZE", "BODYSTRUCTURE",
-                      "BODY.PEEK[TEXT]"]
+            # One round trip with BODYSTRUCTURE so we know who has attachments
+            # and a *partial* BODY.PEEK[TEXT] so the snippet costs ~1 KiB per
+            # email instead of the whole body.
+            body_field: Optional[str]
+            if peek_bytes and peek_bytes > 0:
+                body_field = f"BODY.PEEK[TEXT]<0.{int(peek_bytes)}>"
+            else:
+                body_field = None
+
+            fields = ["ENVELOPE", "FLAGS", "RFC822.SIZE", "BODYSTRUCTURE"]
+            if body_field:
+                fields.append(body_field)
             messages = self.client.fetch(uids_need_body, fields)
             for u, d in messages.items():
                 hdr = self._parse_email_header(u, d)
                 bs = d.get(b"BODYSTRUCTURE")
                 has_att = self._bodystructure_has_attachment(bs)
-                raw_text = d.get(b"BODY[TEXT]") or b""
+                raw_text = b""
+                if body_field:
+                    # Servers may use either the parameterized key or the bare
+                    # key in the response; try both.
+                    for key in (
+                        f"BODY[TEXT]<0>".encode(),
+                        b"BODY[TEXT]",
+                        body_field.replace("BODY.PEEK", "BODY").encode(),
+                    ):
+                        if key in d:
+                            raw_text = d[key] or b""
+                            break
                 text = raw_text.decode("utf-8", errors="replace") if raw_text else ""
                 cached_summaries[u] = {
                     "uid": u,
@@ -2251,6 +2399,8 @@ class ImapClientWrapper:
         flag_name: Optional[str] = None,
         permanent: bool = False,
         dry_run: bool = False,
+        limit: Optional[int] = None,
+        batch_size: int = 1000,
     ) -> dict:
         """Apply ``action`` to every message matching the search criteria.
 
@@ -2260,12 +2410,23 @@ class ImapClientWrapper:
         message is matched but no mutation is performed -- useful as a
         preview.
 
-        Returns ``{"action", "matched", "affected", "uids", "dry_run", ...}``.
+        ``limit`` caps the number of matches that get acted on (oldest-first
+        by UID). The full match count is still reported. ``batch_size``
+        chunks the IMAP command to avoid overrunning command-length limits
+        on large UID sets (some servers reject 50 K-element UID lists in a
+        single STORE/MOVE).
+
+        Returns ``{"action", "matched", "affected", "uids", "dry_run",
+        "truncated", "batch_size", ...}``.
         """
         if action not in self.BULK_ACTIONS:
             raise ValueError(
                 f"Unknown bulk action: {action!r}. Allowed: {sorted(self.BULK_ACTIONS)}"
             )
+        if limit is not None and limit < 0:
+            raise ValueError("limit must be >= 0")
+        if batch_size <= 0:
+            raise ValueError("batch_size must be > 0")
 
         self._ensure_connected()
         if mailbox:
@@ -2298,58 +2459,83 @@ class ImapClientWrapper:
         except Exception:
             uids = self.client.search(criteria)
 
+        matched = len(uids)
+        truncated = False
+        if limit is not None and matched > limit:
+            uids = sorted(uids)[:limit]
+            truncated = True
+
         if not uids:
             return {
-                "action": action, "matched": 0, "affected": 0,
-                "uids": [], "dry_run": dry_run, "mailbox": self.current_mailbox,
+                "action": action, "matched": matched, "affected": 0,
+                "uids": [], "dry_run": dry_run,
+                "mailbox": self.current_mailbox,
+                "truncated": truncated, "batch_size": batch_size,
             }
+
+        target_uids = list(uids)
 
         result: dict = {
             "action": action,
-            "matched": len(uids),
-            "uids": list(uids),
+            "matched": matched,
+            "uids": target_uids,
             "dry_run": dry_run,
             "mailbox": self.current_mailbox,
+            "truncated": truncated,
+            "batch_size": batch_size,
         }
 
         if dry_run:
             result["affected"] = 0
             return result
 
+        def _chunks(seq: list[int]) -> list[list[int]]:
+            return [seq[i:i + batch_size] for i in range(0, len(seq), batch_size)]
+
         if action == "mark_read":
-            self.client.add_flags(uids, [b"\\Seen"])
+            for chunk in _chunks(target_uids):
+                self.client.add_flags(chunk, [b"\\Seen"])
         elif action == "mark_unread":
-            self.client.remove_flags(uids, [b"\\Seen"])
+            for chunk in _chunks(target_uids):
+                self.client.remove_flags(chunk, [b"\\Seen"])
         elif action == "flag":
-            self.client.add_flags(uids, [(flag_name or "\\Flagged").encode()])
+            flag_b = (flag_name or "\\Flagged").encode()
+            for chunk in _chunks(target_uids):
+                self.client.add_flags(chunk, [flag_b])
         elif action == "unflag":
-            self.client.remove_flags(uids, [(flag_name or "\\Flagged").encode()])
+            flag_b = (flag_name or "\\Flagged").encode()
+            for chunk in _chunks(target_uids):
+                self.client.remove_flags(chunk, [flag_b])
         elif action == "archive":
-            self.archive_email(
-                uids=list(uids),
-                archive_folder=destination
-                or self.config.get("folders", {}).get("archive", "Archive"),
-            )
+            folder = destination or self.config.get("folders", {}).get("archive", "Archive")
+            for chunk in _chunks(target_uids):
+                self.archive_email(uids=chunk, archive_folder=folder)
         elif action == "move":
             if not destination:
                 raise ValueError("bulk_action(action='move') requires 'destination'.")
-            self.move_email(uids=list(uids), destination=destination)
+            for chunk in _chunks(target_uids):
+                self.move_email(uids=chunk, destination=destination)
         elif action == "copy":
             if not destination:
                 raise ValueError("bulk_action(action='copy') requires 'destination'.")
-            self.copy_email(uids=list(uids), destination=destination)
+            for chunk in _chunks(target_uids):
+                self.copy_email(uids=chunk, destination=destination)
         elif action == "delete":
-            res = self.delete_email(
-                uids=list(uids),
-                permanent=permanent,
-                trash_folder=destination,
-            )
-            result.update({k: res[k] for k in ("permanent", "moved_to") if k in res})
+            last: dict = {}
+            for chunk in _chunks(target_uids):
+                last = self.delete_email(
+                    uids=chunk,
+                    permanent=permanent,
+                    trash_folder=destination,
+                )
+            result.update({k: last[k] for k in ("permanent", "moved_to") if k in last})
         elif action == "report_spam":
-            res = self.report_spam(uids=list(uids), spam_folder=destination)
-            result.update({k: res[k] for k in ("moved_to", "flag") if k in res})
+            last = {}
+            for chunk in _chunks(target_uids):
+                last = self.report_spam(uids=chunk, spam_folder=destination)
+            result.update({k: last[k] for k in ("moved_to", "flag") if k in last})
 
-        result["affected"] = len(uids)
+        result["affected"] = len(target_uids)
         return result
 
     # === Account health =================================================

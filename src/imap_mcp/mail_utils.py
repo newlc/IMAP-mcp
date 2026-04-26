@@ -16,9 +16,33 @@ from datetime import datetime
 from typing import Any, Callable, Optional
 
 import bleach
+import html2text
 from bleach.css_sanitizer import CSSSanitizer
 
 logger = logging.getLogger(__name__)
+
+
+def html_to_plain(html: str) -> str:
+    """Convert an HTML body to readable plain text.
+
+    Used as a fallback when an email is HTML-only (no ``text/plain`` part)
+    so the FTS index, snippet generator and ``get_email_summary`` still
+    have searchable/displayable text.
+    """
+    if not html:
+        return ""
+    h = html2text.HTML2Text()
+    h.ignore_links = False
+    h.ignore_images = True   # data URIs would bloat the snippet
+    h.ignore_emphasis = False
+    h.body_width = 0          # don't wrap; let the consumer decide
+    h.unicode_snob = True
+    try:
+        return h.handle(html).strip()
+    except Exception as exc:
+        logger.debug("html2text failed: %s", exc)
+        # Last-ditch: strip tags via bleach.
+        return bleach.clean(html, tags=[], strip=True).strip()
 
 
 # ---------------------------------------------------------------------------

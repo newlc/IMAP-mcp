@@ -679,6 +679,7 @@ async def list_tools() -> list[Tool]:
                 },
                 "mailbox": {"type": "string", "description": "Mailbox (default: current)"},
                 "body_chars": {"type": "number", "description": "Max plain-text snippet length (default: 300)"},
+                "peek_bytes": {"type": "number", "description": "Bytes of message text to fetch per uncached UID via partial FETCH (default: max(body_chars*4, 1024); pass 0 for headers only)"},
             },
             ["uids"],
         ),
@@ -706,6 +707,8 @@ async def list_tools() -> list[Tool]:
                 "flag_name": {"type": "string", "description": "Used by flag/unflag (default: \\Flagged)"},
                 "permanent": {"type": "boolean", "description": "For delete: \\Deleted+EXPUNGE instead of moving to Trash"},
                 "dry_run": {"type": "boolean", "description": "Match without mutating (default: false)"},
+                "limit": {"type": "number", "description": "Cap the number of UIDs to act on (oldest-first). The full match count is still reported."},
+                "batch_size": {"type": "number", "description": "Max UIDs per IMAP command (default: 1000) -- some servers reject very long UID lists."},
             },
             ["action"],
         ),
@@ -822,6 +825,7 @@ async def list_tools() -> list[Tool]:
                 "includeSignature": {"type": "boolean", "description": "Include signature from config (default: true)"},
                 "saveToSent": {"type": "boolean", "description": "Save copy to Sent folder (default: true)"},
                 "sentFolder": {"type": "string", "description": "Sent folder name (default: from folders.sent or 'Sent')"},
+                "idempotencyKey": {"type": "string", "description": "If supplied (and persistent cache enabled), repeated calls with the same key return the original result without re-sending."},
             },
             ["to", "subject", "body"],
         ),
@@ -843,6 +847,7 @@ async def list_tools() -> list[Tool]:
                 "includeSignature": {"type": "boolean", "description": "Include signature (default: true)"},
                 "quoteOriginal": {"type": "boolean", "description": "Append quoted original message (default: true)"},
                 "saveToSent": {"type": "boolean", "description": "Save copy to Sent folder (default: true)"},
+                "idempotencyKey": {"type": "string", "description": "Idempotency key (see send_email)"},
             },
             ["uid", "body"],
         ),
@@ -878,6 +883,7 @@ async def list_tools() -> list[Tool]:
                 },
                 "includeSignature": {"type": "boolean", "description": "Include signature (default: true)"},
                 "saveToSent": {"type": "boolean", "description": "Save copy to Sent folder (default: true)"},
+                "idempotencyKey": {"type": "string", "description": "Idempotency key (see send_email)"},
             },
             ["uid", "to"],
         ),
@@ -1114,6 +1120,7 @@ async def handle_tool_call(name: str, args: dict) -> Any:
             uids=args["uids"],
             mailbox=args.get("mailbox"),
             body_chars=args.get("body_chars", 300),
+            peek_bytes=args.get("peek_bytes"),
         )
     elif name == "bulk_action":
         return cli.bulk_action(
@@ -1129,6 +1136,8 @@ async def handle_tool_call(name: str, args: dict) -> Any:
             flag_name=args.get("flag_name"),
             permanent=args.get("permanent", False),
             dry_run=args.get("dry_run", False),
+            limit=args.get("limit"),
+            batch_size=args.get("batch_size", 1000),
         )
 
     # ------------------------------------------------------------------
@@ -1282,6 +1291,7 @@ async def handle_tool_call(name: str, args: dict) -> Any:
             include_signature=args.get("includeSignature", True),
             save_to_sent=args.get("saveToSent", True),
             sent_folder=args.get("sentFolder"),
+            idempotency_key=args.get("idempotencyKey"),
         )
     elif name == "reply_email":
         return cli.reply_email(
@@ -1293,6 +1303,7 @@ async def handle_tool_call(name: str, args: dict) -> Any:
             include_signature=args.get("includeSignature", True),
             quote_original=args.get("quoteOriginal", True),
             save_to_sent=args.get("saveToSent", True),
+            idempotency_key=args.get("idempotencyKey"),
         )
     elif name == "forward_email":
         return cli.forward_email(
@@ -1304,6 +1315,7 @@ async def handle_tool_call(name: str, args: dict) -> Any:
             extra_attachments=args.get("extraAttachments"),
             include_signature=args.get("includeSignature", True),
             save_to_sent=args.get("saveToSent", True),
+            idempotency_key=args.get("idempotencyKey"),
         )
     elif name == "delete_email":
         return cli.delete_email(
