@@ -22,6 +22,12 @@ auto_archive_senders.json
 # pytest
 .pytest_cache/
 
+# Coverage
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
 # IDE
 .vscode/
 .cursor/
