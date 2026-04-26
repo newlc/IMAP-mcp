@@ -73,12 +73,14 @@ from .models import (
 )
 from .cache import EmailCache
 from .mail_utils import (
+    extract_action_items,
     extract_inline_images,
     html_to_plain,
     inline_cid_to_data_uri,
     parse_authentication_results,
     parse_calendar_invites,
     sanitize_html,
+    smart_truncate,
     with_retries,
 )
 from .watcher import ImapWatcher
@@ -624,19 +626,55 @@ class ImapClientWrapper:
         messages = self.client.fetch(uids, ["ENVELOPE", "FLAGS", "RFC822.SIZE"])
         return [self._parse_email_header(uid, data) for uid, data in messages.items()]
 
-    def get_email(self, uid: int, mailbox: Optional[str] = None) -> Email:
-        """Get complete email by UID."""
+    def get_email(
+        self,
+        uid: int,
+        mailbox: Optional[str] = None,
+        peek_bytes: Optional[int] = None,
+    ) -> Email:
+        """Get a complete email by UID.
+
+        With ``peek_bytes`` set, fetches only the headers + the first N
+        bytes of the body via ``BODY.PEEK[HEADER]`` + ``BODY.PEEK[TEXT]<0.N>``.
+        Useful for very large messages where you only need a preview --
+        skips both the IMAP body transfer and the attachment indexing.
+        The returned ``Email`` has ``attachments=[]`` in this mode.
+        """
         self._ensure_connected()
         if mailbox:
             self.select_mailbox(mailbox)
 
         effective_mailbox = mailbox or self.current_mailbox or "INBOX"
 
-        # Check cache first
-        if self.email_cache:
+        # Check cache first (only when fetching the full body -- partial
+        # peek is a different request and shouldn't be served from cache).
+        if peek_bytes is None and self.email_cache:
             cached = self.email_cache.get_email(effective_mailbox, uid)
             if cached and cached.get("has_body"):
                 return self._cached_to_email(cached)
+
+        if peek_bytes is not None and peek_bytes > 0:
+            # Partial fetch path: headers + first N bytes only. Don't index
+            # attachments, don't write to cache (the body is incomplete).
+            fields = [
+                "ENVELOPE", "FLAGS", "RFC822.SIZE",
+                "BODY.PEEK[HEADER]",
+                f"BODY.PEEK[TEXT]<0.{int(peek_bytes)}>",
+            ]
+            data = self.client.fetch([uid], fields)
+            if uid not in data:
+                raise ValueError(f"Email with UID {uid} not found")
+            msg_data = data[uid]
+            header = self._parse_email_header(uid, msg_data)
+            raw_header = msg_data.get(b"BODY[HEADER]", b"")
+            raw_text = (
+                msg_data.get(f"BODY[TEXT]<0>".encode())
+                or msg_data.get(b"BODY[TEXT]")
+                or b""
+            )
+            msg = email.message_from_bytes(raw_header + b"\r\n" + raw_text)
+            body = self._extract_body(msg)
+            return Email(header=header, body=body, attachments=[])
 
         data = self.client.fetch([uid], ["ENVELOPE", "FLAGS", "RFC822.SIZE", "BODY[]"])
         if uid not in data:
@@ -1686,6 +1724,7 @@ class ImapClientWrapper:
         bcc: Optional[list[str]] = None,
         html_body: Optional[str] = None,
         attachments: Optional[list[str]] = None,
+        inline_attachments: Optional[list[tuple[str, str, bytes]]] = None,
         include_signature: bool = True,
         include_bcc_header: bool = False,
         in_reply_to: Optional[str] = None,
@@ -1716,11 +1755,12 @@ class ImapClientWrapper:
         else:
             body_part = MIMEText(final_body, "plain", "utf-8")
 
-        if attachments:
-            self._validate_attachment_paths(attachments)
+        if attachments or inline_attachments:
+            if attachments:
+                self._validate_attachment_paths(attachments)
             msg = MIMEMultipart("mixed")
             msg.attach(body_part)
-            for path_str in attachments:
+            for path_str in attachments or []:
                 path = Path(path_str).expanduser()
                 if not path.is_file():
                     raise FileNotFoundError(f"Attachment not found: {path}")
@@ -1734,6 +1774,20 @@ class ImapClientWrapper:
                 encoders.encode_base64(part)
                 part.add_header(
                     "Content-Disposition", "attachment", filename=path.name
+                )
+                msg.attach(part)
+            # In-memory attachments -- bypass tempfile/disk roundtrip.
+            # Each entry is (filename, content_type, raw_bytes).
+            for filename, ctype, raw in inline_attachments or []:
+                if not ctype:
+                    ctype = "application/octet-stream"
+                maintype, subtype = ctype.split("/", 1)
+                part = MIMEBase(maintype, subtype)
+                part.set_payload(raw)
+                encoders.encode_base64(part)
+                safe_name = (filename or "attachment").replace("/", "_")
+                part.add_header(
+                    "Content-Disposition", "attachment", filename=safe_name
                 )
                 msg.attach(part)
         else:
@@ -1969,6 +2023,7 @@ class ImapClientWrapper:
         bcc: Optional[list[str]] = None,
         html_body: Optional[str] = None,
         attachments: Optional[list[str]] = None,
+        inline_attachments: Optional[list[tuple[str, str, bytes]]] = None,
         include_signature: bool = True,
         save_to_sent: bool = True,
         sent_folder: Optional[str] = None,
@@ -2014,6 +2069,7 @@ class ImapClientWrapper:
             bcc=bcc,
             html_body=html_body,
             attachments=attachments,
+            inline_attachments=inline_attachments,
             include_signature=include_signature,
             include_bcc_header=False,
             in_reply_to=in_reply_to,
@@ -2239,42 +2295,33 @@ class ImapClientWrapper:
             inner_html = orig_body.html or (orig_body.text or "").replace("\n", "<br>")
             final_html = html_intro + inner_html
 
-        attach_paths: list[str] = []
-        tempdir: Optional[str] = None
-        try:
-            if include_attachments:
-                attachments_meta = self._extract_attachment_info(orig)
-                if attachments_meta:
-                    tempdir = tempfile.mkdtemp(prefix="imap-fwd-")
-                    for att in attachments_meta:
-                        data_bytes = self._get_attachment_bytes(orig, att.index)
-                        if not data_bytes:
-                            continue
-                        safe_name = (att.filename or f"attachment_{att.index}").replace(
-                            "/", "_"
-                        )
-                        path = Path(tempdir) / safe_name
-                        with open(path, "wb") as f:
-                            f.write(data_bytes)
-                        attach_paths.append(str(path))
-            if extra_attachments:
-                attach_paths.extend(extra_attachments)
+        # Stream attachments directly from the original message into the
+        # outgoing one -- no temp files, no double-encode round trip.
+        inline_atts: list[tuple[str, str, bytes]] = []
+        if include_attachments:
+            for att in self._extract_attachment_info(orig):
+                data_bytes = self._get_attachment_bytes(orig, att.index)
+                if not data_bytes:
+                    continue
+                inline_atts.append((
+                    att.filename or f"attachment_{att.index}",
+                    att.content_type or "application/octet-stream",
+                    data_bytes,
+                ))
 
-            return self.send_email(
-                to=to,
-                subject=subject,
-                body=final_body,
-                cc=cc,
-                bcc=bcc,
-                html_body=final_html,
-                attachments=attach_paths or None,
-                include_signature=include_signature,
-                save_to_sent=save_to_sent,
-                idempotency_key=idempotency_key,
-            )
-        finally:
-            if tempdir:
-                shutil.rmtree(tempdir, ignore_errors=True)
+        return self.send_email(
+            to=to,
+            subject=subject,
+            body=final_body,
+            cc=cc,
+            bcc=bcc,
+            html_body=final_html,
+            attachments=extra_attachments or None,
+            inline_attachments=inline_atts or None,
+            include_signature=include_signature,
+            save_to_sent=save_to_sent,
+            idempotency_key=idempotency_key,
+        )
 
     def delete_email(
         self,
@@ -2361,6 +2408,108 @@ class ImapClientWrapper:
                 {k: v for k, v in img.items() if k != "data_uri"}
                 for img in inline
             ],
+        }
+
+    def extract_action_items(
+        self, uid: int, mailbox: Optional[str] = None,
+    ) -> dict:
+        """Heuristic action-item extraction (no LLM needed).
+
+        Pulls likely requests, questions, deadlines and blockers out of the
+        plain-text body via regex/keyword matching. Designed as a cheap
+        pre-processing step the AI agent can read before the full email,
+        not a replacement for it.
+        """
+        msg = self.get_email(uid=uid, mailbox=mailbox)
+        text = (msg.body.text if msg.body else "") or ""
+        result = extract_action_items(text)
+        result["uid"] = uid
+        return result
+
+    def watch_until(
+        self,
+        criteria: dict,
+        mailbox: str = "INBOX",
+        timeout: int = 60,
+    ) -> dict:
+        """Wait until a new email matching ``criteria`` arrives.
+
+        ``criteria`` keys (all optional, AND-ed together):
+
+        * ``from_addr`` -- substring match on sender address
+        * ``subject``   -- substring match on subject
+        * ``unread``    -- only unread emails
+
+        Returns the matching email summary, or ``{"timed_out": True}``
+        after ``timeout`` seconds. Useful for OTP-style flows: "wait for
+        the verification code from auth@bank.example.com".
+        """
+        import time as _time
+        self._ensure_connected()
+
+        # Build the IMAP SEARCH spec from the criteria.
+        search: list = []
+        if criteria.get("unread", True):
+            search.append("UNSEEN")
+        if criteria.get("from_addr"):
+            search.extend(["FROM", criteria["from_addr"]])
+        if criteria.get("subject"):
+            search.extend(["SUBJECT", criteria["subject"]])
+        if not search:
+            search = ["UNSEEN"]
+
+        deadline = _time.monotonic() + max(1, int(timeout))
+
+        # Do an initial poll first (cheap, catches the case where the
+        # email already arrived between caller's previous check and now).
+        self.select_mailbox(mailbox)
+        try:
+            uids = self.client.search(search, charset="UTF-8")
+        except Exception:
+            uids = self.client.search(search)
+        if uids:
+            newest = sorted(uids, reverse=True)[0]
+            return {
+                "matched": True,
+                "uid": newest,
+                "summary": self.get_email_summary(uids=[newest], mailbox=mailbox)[0],
+                "elapsed": 0.0,
+            }
+
+        # Then IDLE-poll in short slices until we hit the deadline.
+        start = _time.monotonic()
+        while _time.monotonic() < deadline:
+            try:
+                self.client.idle()
+                slice_timeout = min(20, max(1, int(deadline - _time.monotonic())))
+                responses = self.client.idle_check(timeout=slice_timeout)
+                self.client.idle_done()
+            except Exception as exc:
+                logger_imap.debug("watch_until IDLE failed: %s; falling back to poll", exc)
+                _time.sleep(1)
+                responses = ["fallback"]
+
+            if not responses:
+                continue
+            try:
+                uids = self.client.search(search, charset="UTF-8")
+            except Exception:
+                uids = self.client.search(search)
+            if uids:
+                newest = sorted(uids, reverse=True)[0]
+                return {
+                    "matched": True,
+                    "uid": newest,
+                    "summary": self.get_email_summary(
+                        uids=[newest], mailbox=mailbox
+                    )[0],
+                    "elapsed": _time.monotonic() - start,
+                }
+
+        return {
+            "matched": False,
+            "timed_out": True,
+            "elapsed": _time.monotonic() - start,
         }
 
     def get_email_auth_results(
@@ -2627,7 +2776,7 @@ class ImapClientWrapper:
                     "unread": "\\Seen" not in hdr.flags,
                     "size": hdr.size,
                     "has_attachments": has_att,
-                    "snippet": (text[:body_chars] + "…") if len(text) > body_chars else text,
+                    "snippet": smart_truncate(text, body_chars),
                 }
 
         # Preserve input order.
@@ -2652,7 +2801,7 @@ class ImapClientWrapper:
             "unread": "\\Seen" not in flags,
             "size": row.get("size"),
             "has_attachments": False,  # cache layer doesn't track this directly
-            "snippet": (text[:body_chars] + "…") if len(text) > body_chars else text,
+            "snippet": smart_truncate(text, body_chars),
         }
 
     # === Bulk operations by query =======================================

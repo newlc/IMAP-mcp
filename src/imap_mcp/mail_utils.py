@@ -22,6 +22,128 @@ from bleach.css_sanitizer import CSSSanitizer
 logger = logging.getLogger(__name__)
 
 
+def smart_truncate(text: str, max_chars: int, ellipsis: str = "…") -> str:
+    """Truncate ``text`` to at most ``max_chars`` characters on a word boundary.
+
+    Prefers cutting at sentence boundaries (``.``/``!``/``?``) within the
+    last 25% of the budget, then word boundaries. Falls back to a hard
+    character cut for pathological inputs (long unbroken strings).
+    """
+    if not text or len(text) <= max_chars:
+        return text or ""
+    candidate = text[:max_chars]
+    # Prefer a sentence boundary in the last 25% of the budget.
+    soft_window = candidate[int(max_chars * 0.75):]
+    sentence_end = max(
+        soft_window.rfind(". "),
+        soft_window.rfind("! "),
+        soft_window.rfind("? "),
+        soft_window.rfind(".\n"),
+        soft_window.rfind("!\n"),
+        soft_window.rfind("?\n"),
+    )
+    if sentence_end >= 0:
+        cut = int(max_chars * 0.75) + sentence_end + 1
+        return candidate[:cut].rstrip() + ellipsis
+    # Fall back to word boundary.
+    word_end = candidate.rfind(" ")
+    if word_end > 0:
+        return candidate[:word_end].rstrip() + ellipsis
+    return candidate.rstrip() + ellipsis
+
+
+# Regular expressions used by extract_action_items. Compiled at import.
+import re as _re_ai
+
+_DATE_PATTERNS = [
+    _re_ai.compile(
+        r"\b(?:by|before|due|deadline)[:\s]+"
+        r"((?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\w*|"
+        r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+\d+(?:st|nd|rd|th)?(?:,?\s+\d{4})?|"
+        r"\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?|"
+        r"\d{4}-\d{2}-\d{2}|"
+        r"tomorrow|today|tonight|next\s+\w+|end\s+of\s+(?:day|week|month))\b",
+        _re_ai.IGNORECASE,
+    ),
+]
+
+_REQUEST_PATTERNS = [
+    _re_ai.compile(
+        r"\b(?:could|can|would|will)\s+you\s+(?:please\s+)?([^.?!\n]{5,120})[.?!\n]",
+        _re_ai.IGNORECASE,
+    ),
+    _re_ai.compile(
+        r"\bplease\s+([^.?!\n]{5,120})[.?!\n]",
+        _re_ai.IGNORECASE,
+    ),
+    _re_ai.compile(
+        r"\b(?:need|require|want)\s+(?:you\s+)?to\s+([^.?!\n]{5,120})[.?!\n]",
+        _re_ai.IGNORECASE,
+    ),
+]
+
+_QUESTION_PATTERN = _re_ai.compile(
+    r"([A-Z][^.?!\n]{8,160}\?)",
+)
+
+_BLOCKER_PATTERNS = [
+    _re_ai.compile(
+        r"\b(?:blocker|blocked\s+(?:by|on)|waiting\s+for|need\s+input|stuck)\b"
+        r"[:\s]+([^.?!\n]{5,160})",
+        _re_ai.IGNORECASE,
+    ),
+]
+
+
+def extract_action_items(text: str, max_items: int = 20) -> dict:
+    """Heuristic extraction of action items, deadlines, questions, blockers.
+
+    Pure regex/keyword based -- no LLM call. Useful as a *pre-processing*
+    step that gives an agent a head start before it reads the full body,
+    and as a fallback for rate-limited / cost-sensitive contexts.
+
+    Returns ``{"requests": [...], "questions": [...], "deadlines": [...],
+    "blockers": [...]}``. Each list entry contains ``text`` (trimmed) and
+    ``offset`` (character index into ``text``).
+    """
+    if not text:
+        return {"requests": [], "questions": [], "deadlines": [], "blockers": []}
+
+    out: dict[str, list[dict]] = {
+        "requests": [], "questions": [], "deadlines": [], "blockers": [],
+    }
+
+    def _push(bucket: str, snippet: str, offset: int) -> None:
+        if len(out[bucket]) >= max_items:
+            return
+        cleaned = " ".join(snippet.strip().split())
+        if not cleaned:
+            return
+        # Dedupe by lowercase text so "please send X" doesn't show twice.
+        key = cleaned.lower()
+        if any(item["_key"] == key for item in out[bucket]):
+            return
+        out[bucket].append({"text": cleaned, "offset": offset, "_key": key})
+
+    for pat in _REQUEST_PATTERNS:
+        for m in pat.finditer(text):
+            _push("requests", m.group(0), m.start())
+    for m in _QUESTION_PATTERN.finditer(text):
+        _push("questions", m.group(1), m.start())
+    for pat in _DATE_PATTERNS:
+        for m in pat.finditer(text):
+            _push("deadlines", m.group(0), m.start())
+    for pat in _BLOCKER_PATTERNS:
+        for m in pat.finditer(text):
+            _push("blockers", m.group(0), m.start())
+
+    # Drop the dedupe key from the response payload.
+    for bucket in out.values():
+        for item in bucket:
+            item.pop("_key", None)
+    return out
+
+
 def parse_authentication_results(headers) -> dict:
     """Parse one or more ``Authentication-Results`` headers (RFC 8601).
 

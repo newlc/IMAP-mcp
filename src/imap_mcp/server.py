@@ -205,10 +205,13 @@ async def list_tools() -> list[Tool]:
         ),
         make_tool(
             "get_email",
-            "Get complete email by UID",
+            "Get complete email by UID. With peek_bytes set, fetches only "
+            "headers + first N body bytes (no attachments, no cache write) -- "
+            "useful for very large messages.",
             {
                 "uid": {"type": "number", "description": "Email UID"},
                 "mailbox": {"type": "string", "description": "Mailbox name (default: current)"},
+                "peek_bytes": {"type": "number", "description": "If set, partial fetch limited to N body bytes (RFC 3501 BODY[TEXT]<0.N>)"},
             },
             ["uid"],
         ),
@@ -770,6 +773,31 @@ async def list_tools() -> list[Tool]:
             },
             ["uid"],
         ),
+        make_tool(
+            "extract_action_items",
+            "Heuristic extraction of requests/questions/deadlines/blockers "
+            "from one email's plain-text body. Pure regex -- no LLM call. "
+            "Returns {requests, questions, deadlines, blockers}, each a "
+            "list of {text, offset}.",
+            {
+                "uid": {"type": "number", "description": "Email UID"},
+                "mailbox": {"type": "string", "description": "Mailbox (default: current)"},
+            },
+            ["uid"],
+        ),
+        make_tool(
+            "watch_until",
+            "Wait via IMAP IDLE for a new email matching from_addr/subject/"
+            "unread. Returns the email summary on match or {'timed_out': "
+            "true} after timeout seconds. Useful for OTP-style flows.",
+            {
+                "from_addr": {"type": "string", "description": "Filter by sender substring"},
+                "subject": {"type": "string", "description": "Filter by subject substring"},
+                "unread": {"type": "boolean", "description": "Only unread (default: true)"},
+                "mailbox": {"type": "string", "description": "Mailbox to watch (default: INBOX)"},
+                "timeout": {"type": "number", "description": "Max seconds to wait (default: 60)"},
+            },
+        ),
         # === Compact summaries ===
         make_tool(
             "get_email_summary",
@@ -1092,6 +1120,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     """Handle tool calls."""
     try:
         result = await handle_tool_call(name, arguments)
+        # Opportunistically flush any pending resource-update notifications
+        # picked up by IDLE watchers since the last call.
+        try:
+            await _flush_resource_notifications()
+        except Exception:
+            pass
         return [TextContent(type="text", text=serialize_result(result))]
     except Exception as e:
         return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
@@ -1176,6 +1210,7 @@ async def _dispatch_tool(name: str, args: dict, account: Optional[str]) -> Any:
     # ------------------------------------------------------------------
     if name == "auto_connect":
         account_manager.load_config(_config_path)
+        _wire_resource_subscriptions()
         return {
             "loaded": True,
             "config_path": _config_path,
@@ -1249,7 +1284,10 @@ async def _dispatch_tool(name: str, args: dict, account: Optional[str]) -> Any:
             before=args.get("before"),
         )
     elif name == "get_email":
-        return cli.get_email(uid=args["uid"], mailbox=args.get("mailbox"))
+        return cli.get_email(
+            uid=args["uid"], mailbox=args.get("mailbox"),
+            peek_bytes=args.get("peek_bytes"),
+        )
     elif name == "get_email_headers":
         return cli.get_email_headers(uid=args["uid"], mailbox=args.get("mailbox"))
     elif name == "get_email_body":
@@ -1292,6 +1330,20 @@ async def _dispatch_tool(name: str, args: dict, account: Optional[str]) -> Any:
     elif name == "thread_summary":
         return cli.thread_summary(
             uid=args["uid"], mailbox=args.get("mailbox")
+        )
+    elif name == "extract_action_items":
+        return cli.extract_action_items(
+            uid=args["uid"], mailbox=args.get("mailbox")
+        )
+    elif name == "watch_until":
+        criteria = {
+            k: args[k] for k in ("from_addr", "subject", "unread")
+            if k in args
+        }
+        return cli.watch_until(
+            criteria=criteria,
+            mailbox=args.get("mailbox", "INBOX"),
+            timeout=int(args.get("timeout", 60)),
         )
     elif name == "get_email_summary":
         return cli.get_email_summary(
@@ -1785,6 +1837,68 @@ def _format_mailbox_summary(cli, mailbox: str) -> str:
     return "\n".join(lines)
 
 
+# In-memory subscription registry. The watcher thread can't reach the
+# active session directly, so it pushes account names into this set; the
+# next chance the server has to notify (next call_tool, etc.) it picks
+# them up. Per-account dirty-flag keeps notification cost O(1).
+_subscribed_uris: set[str] = set()
+_dirty_overviews: set[str] = set()
+
+
+def _mark_overview_dirty(account_name: str) -> None:
+    """Called by the IDLE watcher when a watched mailbox changes."""
+    _dirty_overviews.add(account_name)
+
+
+def _wire_resource_subscriptions() -> None:
+    """Attach the dirty-flag callback to every account's watcher."""
+    for acct in account_manager.accounts.values():
+        watcher = getattr(acct.client, "watcher", None)
+        if watcher is None:
+            continue
+        # Wrap the existing on_update so we don't clobber it.
+        prior = watcher.on_update
+        def _make(name):
+            def _cb(key, cache):
+                _mark_overview_dirty(name)
+                if prior:
+                    try:
+                        prior(key, cache)
+                    except Exception:
+                        pass
+            return _cb
+        watcher.on_update = _make(acct.name)
+
+
+@server.subscribe_resource()
+async def subscribe_resource(uri) -> None:
+    """Track which resources the client is watching for updates."""
+    _subscribed_uris.add(str(uri))
+
+
+@server.unsubscribe_resource()
+async def unsubscribe_resource(uri) -> None:
+    _subscribed_uris.discard(str(uri))
+
+
+async def _flush_resource_notifications() -> None:
+    """If the watcher marked any overview dirty, notify subscribed clients."""
+    if not _dirty_overviews or not _subscribed_uris:
+        return
+    try:
+        session = server.request_context.session
+    except (LookupError, AttributeError):
+        return
+    for account_name in list(_dirty_overviews):
+        uri = f"imap://{account_name}/overview"
+        if uri in _subscribed_uris:
+            try:
+                await session.send_resource_updated(uri)
+            except Exception:
+                pass
+    _dirty_overviews.clear()
+
+
 @server.read_resource()
 async def read_resource(uri):
     """Resolve an ``imap://...`` URI into renderable text."""
@@ -2005,6 +2119,37 @@ def main():
              "multi-account format. The original is backed up to "
              "<path>.bak.",
     )
+    parser.add_argument(
+        "--check-config",
+        action="store_true",
+        help="Validate config.json structure, look up keyring passwords, "
+             "and exit with a clear pass/fail report. Does not start the "
+             "MCP server.",
+    )
+    parser.add_argument(
+        "--check-connection",
+        action="store_true",
+        help="With --check-config, also try to open an IMAP socket per "
+             "account (slower; does network IO).",
+    )
+    parser.add_argument(
+        "--init-account",
+        metavar="PROVIDER",
+        help="Print a starter account block for one of the known providers "
+             "(gmail, outlook, fastmail, proton, icloud, yahoo, yandex). "
+             "Use together with --account NAME to set the account name.",
+    )
+    parser.add_argument(
+        "--init-account-username",
+        metavar="EMAIL",
+        help="Username/email for --init-account.",
+    )
+    parser.add_argument(
+        "--print-schema",
+        action="store_true",
+        help="Print the JSON Schema for config.json to stdout. Pipe to a "
+             "file and reference it in your editor for autocomplete.",
+    )
     args = parser.parse_args()
 
     if args.migrate_config:
@@ -2016,6 +2161,56 @@ def main():
             raise SystemExit(1)
         print(f"Migrated. Backup written to {backup}")
         return
+
+    if args.print_schema:
+        from .providers import CONFIG_JSON_SCHEMA
+        print(json.dumps(CONFIG_JSON_SCHEMA, indent=2, ensure_ascii=False))
+        return
+
+    if args.init_account:
+        from .providers import make_starter_account, PROVIDER_TEMPLATES
+        if args.init_account not in PROVIDER_TEMPLATES:
+            print(f"Unknown provider: {args.init_account!r}.")
+            print(f"Known: {sorted(PROVIDER_TEMPLATES)}")
+            raise SystemExit(1)
+        if not args.init_account_username:
+            print("Error: --init-account requires --init-account-username EMAIL")
+            raise SystemExit(1)
+        account_name = args.account or args.init_account
+        block = make_starter_account(
+            args.init_account, account_name, args.init_account_username,
+        )
+        print(json.dumps(block, indent=2, ensure_ascii=False))
+        print(
+            "\n# Copy the block above into the 'accounts' array of "
+            "your config.json.\n"
+            f"# Then run: imap-mcp --set-password --config <path> --account {account_name}",
+            file=__import__("sys").stderr,
+        )
+        return
+
+    if args.check_config:
+        from .providers import validate_config
+        result = validate_config(
+            args.config,
+            check_connection=args.check_connection,
+        )
+        if result["valid"]:
+            print(f"OK: {args.config}")
+        else:
+            print(f"INVALID: {args.config}")
+        for err in result.get("errors", []):
+            print(f"  ERROR: {err}")
+        for warn in result.get("warnings", []):
+            print(f"  WARN:  {warn}")
+        for acct in result.get("accounts", []):
+            status = "ok" if acct["ok"] else "FAIL"
+            print(f"  account {acct['name']!r}: {status}")
+            for err in acct.get("errors", []):
+                print(f"    ERROR: {err}")
+            for warn in acct.get("warnings", []):
+                print(f"    WARN:  {warn}")
+        raise SystemExit(0 if result["valid"] else 1)
 
     if args.set_password or args.delete_password:
         from .accounts import AccountManager as _AM

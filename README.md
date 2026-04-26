@@ -44,6 +44,13 @@ The local cache turns your mailbox into a queryable database that AI assistants 
 - **bm25-weighted FTS5 ranking** -- subject hits outrank body hits which outrank address hits
 - **Thread tools** -- `extract_recipients_from_thread` (assemble reply-all lists) and `thread_summary` (LLM-friendly chronological summary)
 - **Paginated mailbox listing** -- `list_mailboxes` accepts `cursor`/`limit` for servers with thousands of folders
+- **Provider templates + onboarding** -- `imap-mcp --init-account gmail|outlook|fastmail|proton|icloud|yahoo|yandex` prints a starter account block; `imap-mcp --check-config` validates config + keyring without starting the server; `imap-mcp --print-schema` exports a JSON Schema for IDE autocomplete
+- **Streaming forward_email** -- attachments stay in memory, no temp-file roundtrip; safe with multi-megabyte attachments
+- **Partial body fetch in `get_email`** -- pass `peek_bytes` to fetch only headers + first N body bytes for huge messages
+- **Token-aware snippets** -- `get_email_summary` cuts on sentence/word boundaries via `smart_truncate`
+- **`extract_action_items(uid)`** -- regex-based heuristic surface of requests/questions/deadlines/blockers (no LLM call)
+- **`watch_until(criteria, timeout)`** -- IDLE-poll for an OTP-style email matching `from_addr`/`subject`
+- **MCP resource subscriptions** -- clients can `subscribe` to `imap://{account}/overview`; the IDLE watcher flips a dirty flag and the server emits `resource/updated` notifications
 - **Idempotent send/reply/forward** -- pass an `idempotencyKey` and a retry after a network blip won't re-send the message
 - **Attachment safety** -- `security.max_attachment_size_mb` (default 25 MB) is always enforced; opt-in `security.attachments_allowed_dirs` allowlist blocks prompt-injection from attaching files outside whitelisted folders (symlinks resolved before the check)
 - **HTML-only fallback** -- when an email has no `text/plain` part, the cache, FTS index and snippets are populated from `html2text`-converted HTML
