@@ -125,7 +125,7 @@ class TestNamespaceRetry:
         result = imap_client.save_draft(
             to=["x@y.com"], subject="Test", body="body", drafts_folder="Drafts"
         )
-        assert result is True
+        assert result["saved"] is True
         second_call = mock_imap_client.append.call_args_list[1]
         assert second_call[0][0] == "INBOX.Drafts"
 
@@ -138,7 +138,7 @@ class TestNamespaceRetry:
         result = imap_client.save_draft(
             to=["x@y.com"], subject="Test", body="body", drafts_folder="Drafts"
         )
-        assert result is True
+        assert result["saved"] is True
 
     def test_save_draft_does_not_retry_unrelated(self, imap_client, mock_imap_client):
         """save_draft does NOT retry for unrelated errors."""

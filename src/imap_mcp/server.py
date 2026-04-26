@@ -50,6 +50,7 @@ WRITE_TOOL_NAMES = frozenset({
     "sieve_delete_script",
     "sieve_activate_script",
     "rotate_encryption_key",
+    "import_cache",
 })
 
 # Create MCP server
@@ -158,9 +159,12 @@ async def list_tools() -> list[Tool]:
         # === Mailboxes ===
         make_tool(
             "list_mailboxes",
-            "List all mailbox folders",
+            "List all mailbox folders. Returns {mailboxes, total, next_cursor}; "
+            "pass cursor + limit to paginate on servers with thousands of folders.",
             {
-                "pattern": {"type": "string", "description": "Filter pattern (optional)"},
+                "pattern": {"type": "string", "description": "Filter pattern (default: *)"},
+                "cursor": {"type": "number", "description": "Pagination offset (default: 0)"},
+                "limit": {"type": "number", "description": "Max mailboxes to return (omit for all)"},
             },
         ),
         make_tool(
@@ -442,6 +446,7 @@ async def list_tools() -> list[Tool]:
                 },
                 "draftsFolder": {"type": "string", "description": "Drafts folder name (default: Drafts)"},
                 "includeSignature": {"type": "boolean", "description": "Include signature from config (default: true)"},
+                "idempotencyKey": {"type": "string", "description": "If set (and persistent cache enabled), repeated calls with the same key return the original result without re-appending."},
             },
             ["to", "subject", "body"],
         ),
@@ -542,10 +547,62 @@ async def list_tools() -> list[Tool]:
             },
         ),
         make_tool(
+            "audit_log_query",
+            "Read recent audit-log entries (every tool call is logged with "
+            "account, args, status). Newest first.",
+            {
+                "limit": {"type": "number", "description": "Max rows (default: 100)"},
+                "tool": {"type": "string", "description": "Filter by tool name"},
+                "write_only": {"type": "boolean", "description": "Only --write tool calls"},
+                "since": {"type": "string", "description": "ISO timestamp (inclusive)"},
+            },
+        ),
+        make_tool(
+            "cleanup_audit_log",
+            "Delete audit_log rows older than N days. Returns counts.",
+            {
+                "older_than_days": {
+                    "type": "number",
+                    "description": "Cutoff in days (default: 90)",
+                },
+            },
+        ),
+        make_tool(
+            "get_email_auth_results",
+            "Parse SPF/DKIM/DMARC verdicts from Authentication-Results "
+            "headers (RFC 8601). Cheap -- fetches only the relevant header.",
+            {
+                "uid": {"type": "number", "description": "Email UID"},
+                "mailbox": {"type": "string", "description": "Mailbox (default: current)"},
+            },
+            ["uid"],
+        ),
+        make_tool(
             "vacuum_cache",
             "Compact the cache database (VACUUM + FTS5 optimize) and report "
             "size before/after.",
             {},
+        ),
+        make_tool(
+            "export_cache",
+            "Write a passphrase-protected, machine-portable snapshot of "
+            "this account's cache (subject/body/attachments/sent_log/FTS5).",
+            {
+                "passphrase": {"type": "string", "description": "Passphrase to derive the export key (PBKDF2-HMAC-SHA256, 600k iters)"},
+                "output_path": {"type": "string", "description": "Destination file path"},
+            },
+            ["passphrase", "output_path"],
+        ),
+        make_tool(
+            "import_cache",
+            "Replace this account's cache with the contents of a portable "
+            "export. The current cache is wiped first; rejects on wrong "
+            "passphrase or corrupted file.",
+            {
+                "passphrase": {"type": "string", "description": "Passphrase used at export time"},
+                "input_path": {"type": "string", "description": "Path to the IMAPMCP1 file"},
+            },
+            ["passphrase", "input_path"],
         ),
         # === Auto-Archive ===
         make_tool(
@@ -688,6 +745,27 @@ async def list_tools() -> list[Tool]:
             "...). Returns [] if there is no calendar part.",
             {
                 "uid": {"type": "number", "description": "Email UID"},
+                "mailbox": {"type": "string", "description": "Mailbox (default: current)"},
+            },
+            ["uid"],
+        ),
+        make_tool(
+            "extract_recipients_from_thread",
+            "Collect every distinct address that appears in the thread with "
+            "the given seed UID. Useful for assembling reply-all lists "
+            "without manually parsing headers.",
+            {
+                "uid": {"type": "number", "description": "Any UID in the thread"},
+                "mailbox": {"type": "string", "description": "Mailbox (default: current)"},
+            },
+            ["uid"],
+        ),
+        make_tool(
+            "thread_summary",
+            "Compact LLM-friendly summary of the whole thread (title, span, "
+            "participants, chronological message list).",
+            {
+                "uid": {"type": "number", "description": "Any UID in the thread"},
                 "mailbox": {"type": "string", "description": "Mailbox (default: current)"},
             },
             ["uid"],
@@ -1037,6 +1115,61 @@ async def handle_tool_call(name: str, args: dict) -> Any:
             )
 
     account = args.get("account")
+    is_write = (
+        name in WRITE_TOOL_NAMES
+        or (name == "bulk_action" and args.get("action") in
+            {"delete", "move", "copy", "archive", "report_spam",
+             "mark_read", "mark_unread", "flag", "unflag"})
+    )
+
+    try:
+        result = await _dispatch_tool(name, args, account)
+        _record_audit(account, name, is_write, args, "ok", None)
+        return result
+    except Exception as exc:
+        _record_audit(account, name, is_write, args, "error", str(exc))
+        raise
+
+
+def _record_audit(
+    account: Optional[str], name: str, is_write: bool,
+    args: dict, status: str, error: Optional[str],
+) -> None:
+    """Best-effort: write to the default account's cache audit_log table."""
+    try:
+        if not account_manager.has_accounts():
+            return
+        # Pick a cache to write to: prefer the named account, fall back to
+        # the default. Skip silently if neither has a cache.
+        try:
+            target = account_manager.get_account(account)
+        except (ValueError, RuntimeError):
+            target = None
+        if target is None:
+            return
+        if not target._connected:
+            # Don't lazily-connect just to log -- that would defeat lazy mode.
+            return
+        cache = target.client.email_cache
+        if not cache:
+            return
+        # Strip the account arg from the snapshot since it's already a
+        # column. Drop bulky args (file contents, full bodies).
+        log_args = {k: v for k, v in args.items() if k != "account"}
+        for k in ("body", "htmlBody", "content"):
+            if k in log_args and isinstance(log_args[k], str) and len(log_args[k]) > 200:
+                log_args[k] = log_args[k][:200] + "..."
+        cache.record_audit(
+            account or account_manager.default_name,
+            name, is_write, log_args, status, error,
+        )
+    except Exception:
+        # Audit logging must never break the actual call.
+        pass
+
+
+async def _dispatch_tool(name: str, args: dict, account: Optional[str]) -> Any:
+    """Real tool dispatch -- the original handle_tool_call body."""
 
     # ------------------------------------------------------------------
     # Global tools that don't target a specific account
@@ -1080,7 +1213,11 @@ async def handle_tool_call(name: str, args: dict) -> Any:
     # Mailboxes
     # ------------------------------------------------------------------
     if name == "list_mailboxes":
-        return cli.list_mailboxes(pattern=args.get("pattern", "*"))
+        return cli.list_mailboxes(
+            pattern=args.get("pattern", "*"),
+            cursor=int(args.get("cursor", 0)),
+            limit=args.get("limit"),
+        )
     elif name == "select_mailbox":
         return cli.select_mailbox(args["mailbox"])
     elif name == "create_mailbox":
@@ -1146,6 +1283,14 @@ async def handle_tool_call(name: str, args: dict) -> Any:
         )
     elif name == "get_calendar_invites":
         return cli.get_calendar_invites(
+            uid=args["uid"], mailbox=args.get("mailbox")
+        )
+    elif name == "extract_recipients_from_thread":
+        return cli.extract_recipients_from_thread(
+            uid=args["uid"], mailbox=args.get("mailbox")
+        )
+    elif name == "thread_summary":
+        return cli.thread_summary(
             uid=args["uid"], mailbox=args.get("mailbox")
         )
     elif name == "get_email_summary":
@@ -1279,6 +1424,7 @@ async def handle_tool_call(name: str, args: dict) -> Any:
             attachments=args.get("attachments"),
             drafts_folder=args.get("draftsFolder", "Drafts"),
             include_signature=args.get("includeSignature", True),
+            idempotency_key=args.get("idempotencyKey"),
         )
     elif name == "update_draft":
         return cli.update_draft(
@@ -1402,8 +1548,37 @@ async def handle_tool_call(name: str, args: dict) -> Any:
         return cli.cleanup_sent_log(
             older_than_days=int(args.get("older_than_days", 30))
         )
+    elif name == "audit_log_query":
+        if not cli.email_cache:
+            raise RuntimeError("Persistent cache is disabled.")
+        return cli.email_cache.query_audit_log(
+            limit=int(args.get("limit", 100)),
+            tool=args.get("tool"),
+            write_only=bool(args.get("write_only", False)),
+            since=args.get("since"),
+        )
+    elif name == "cleanup_audit_log":
+        if not cli.email_cache:
+            raise RuntimeError("Persistent cache is disabled.")
+        return cli.email_cache.cleanup_audit_log(
+            older_than_days=int(args.get("older_than_days", 90))
+        )
+    elif name == "get_email_auth_results":
+        return cli.get_email_auth_results(
+            uid=args["uid"], mailbox=args.get("mailbox"),
+        )
     elif name == "vacuum_cache":
         return cli.vacuum_cache()
+    elif name == "export_cache":
+        return cli.export_cache(
+            passphrase=args["passphrase"],
+            output_path=args["output_path"],
+        )
+    elif name == "import_cache":
+        return cli.import_cache(
+            passphrase=args["passphrase"],
+            input_path=args["input_path"],
+        )
     elif name == "rotate_encryption_key":
         return cli.rotate_encryption_key()
 

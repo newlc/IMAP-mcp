@@ -431,7 +431,7 @@ class TestSaveDraftAttachments:
             body="See attached.",
             attachments=[str(attach_path)],
         )
-        assert result is True
+        assert result["saved"] is True
         msg_bytes = mock_imap_client.append.call_args[0][1]
         assert b"multipart/mixed" in msg_bytes
         assert b'filename="spec.txt"' in msg_bytes

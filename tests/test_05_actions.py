@@ -92,7 +92,8 @@ class TestActions:
             drafts_folder="Drafts",
             include_signature=True,
         )
-        assert result is True
+        assert result["saved"] is True
+        assert result["idempotent_replay"] is False
         mock_imap_client.append.assert_called_once()
         call_args = mock_imap_client.append.call_args
         assert call_args[0][0] == "Drafts"
@@ -107,7 +108,7 @@ class TestActions:
             drafts_folder="Drafts",
             include_signature=False,
         )
-        assert result is True
+        assert result["saved"] is True
         # Check the message bytes don't include signature
         call_args = mock_imap_client.append.call_args
         msg_bytes = call_args[0][1]
@@ -122,7 +123,7 @@ class TestActions:
             html_body="<html><body><h1>HTML Version</h1></body></html>",
             drafts_folder="Drafts",
         )
-        assert result is True
+        assert result["saved"] is True
         call_args = mock_imap_client.append.call_args
         msg_bytes = call_args[0][1]
         assert b"multipart/alternative" in msg_bytes
@@ -137,7 +138,7 @@ class TestActions:
             bcc=["bcc@example.com"],
             drafts_folder="Drafts",
         )
-        assert result is True
+        assert result["saved"] is True
         call_args = mock_imap_client.append.call_args
         msg_bytes = call_args[0][1]
         assert b"cc@example.com" in msg_bytes
@@ -155,7 +156,7 @@ class TestActions:
             body="body",
             drafts_folder="Drafts",
         )
-        assert result is True
+        assert result["saved"] is True
         assert mock_imap_client.append.call_count == 2
         second_call = mock_imap_client.append.call_args_list[1]
         assert second_call[0][0] == "INBOX.Drafts"

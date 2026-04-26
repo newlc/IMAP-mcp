@@ -22,6 +22,47 @@ from bleach.css_sanitizer import CSSSanitizer
 logger = logging.getLogger(__name__)
 
 
+def parse_authentication_results(headers) -> dict:
+    """Parse one or more ``Authentication-Results`` headers (RFC 8601).
+
+    Accepts either a single header value (str) or an iterable. Returns
+    ``{"spf": "pass", "dkim": "fail", "dmarc": "pass", "raw": [...]}``
+    where each verdict is the lowercased ``method=result`` token. Methods
+    not present in the header are omitted (callers can treat absence as
+    "unknown").
+    """
+    if isinstance(headers, str):
+        values = [headers] if headers else []
+    elif headers is None:
+        values = []
+    else:
+        values = [v for v in headers if v]
+
+    if not values:
+        return {"raw": []}
+
+    out: dict = {"raw": list(values)}
+    # The header is a semicolon-separated list of methods. We're only after
+    # the verdict tokens like spf=pass / dkim=fail / dmarc=pass.
+    import re
+    pattern = re.compile(
+        r"\b(spf|dkim|dmarc|arc|bimi|dkim-atps)\s*=\s*([a-z]+)",
+        re.IGNORECASE,
+    )
+    for value in values:
+        for method, verdict in pattern.findall(value):
+            method_l = method.lower()
+            verdict_l = verdict.lower()
+            # Keep the strongest negative signal we've seen (prefer "fail"
+            # over "pass" if any header reports a failure).
+            existing = out.get(method_l)
+            if existing == "fail":
+                continue
+            if existing is None or verdict_l == "fail":
+                out[method_l] = verdict_l
+    return out
+
+
 def html_to_plain(html: str) -> str:
     """Convert an HTML body to readable plain text.
 

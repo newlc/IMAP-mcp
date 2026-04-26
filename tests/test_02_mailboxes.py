@@ -10,11 +10,13 @@ class TestMailboxes:
     def test_list_mailboxes(self, imap_client, mock_imap_client):
         """Test listing all mailboxes."""
         result = imap_client.list_mailboxes()
-        assert isinstance(result, list)
-        assert len(result) == 8
-        assert all(isinstance(m, MailboxInfo) for m in result)
-        inbox_found = any(m.name == "INBOX" for m in result)
-        assert inbox_found, "INBOX not found in mailboxes"
+        assert isinstance(result, dict)
+        assert result["total"] == 8
+        assert result["next_cursor"] is None
+        mboxes = result["mailboxes"]
+        assert len(mboxes) == 8
+        assert all(isinstance(m, MailboxInfo) for m in mboxes)
+        assert any(m.name == "INBOX" for m in mboxes)
 
     def test_list_mailboxes_with_pattern(self, imap_client, mock_imap_client):
         """Test listing mailboxes with pattern."""
@@ -22,8 +24,9 @@ class TestMailboxes:
             ((b"\\HasNoChildren",), "/", "INBOX"),
         ]
         result = imap_client.list_mailboxes(pattern="INBOX*")
-        assert isinstance(result, list)
-        assert len(result) == 1
+        assert isinstance(result, dict)
+        assert result["total"] == 1
+        assert len(result["mailboxes"]) == 1
         mock_imap_client.list_folders.assert_called_with(pattern="INBOX*")
 
     def test_select_mailbox(self, imap_client, mock_imap_client):

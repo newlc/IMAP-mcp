@@ -38,7 +38,12 @@ The local cache turns your mailbox into a queryable database that AI assistants 
 - **Watcher reconnect jitter** -- IDLE watchers stagger their initial connect (0-2 s) and back off with jittered exponential delay so a network flap doesn't trigger a thundering herd
 - **MCP resources** -- accounts and emails are exposed as `imap://{account}/overview`, `imap://{account}/health`, and `imap://{account}/{mailbox}/{uid}` resources, so MCP clients can cite them directly
 - **MCP prompts** -- pre-baked workflow prompts (`summarize_inbox`, `triage_inbox`, `draft_reply`, `extract_action_items`, `find_similar_emails`)
-- **Cache maintenance** -- `cleanup_sent_log` purges old idempotency entries, `vacuum_cache` compacts the database, `rotate_encryption_key` *(--write)* re-encrypts the on-disk snapshot with a fresh Fernet key (with previous key backed up under `<keyring_username>.previous`)
+- **Cache maintenance** -- `cleanup_sent_log` / `cleanup_audit_log` purge old rows, `vacuum_cache` compacts the database, `rotate_encryption_key` *(--write)* re-encrypts the on-disk snapshot with a fresh Fernet key, `export_cache` / `import_cache` *(--write)* produce passphrase-protected portable snapshots
+- **Audit log** -- every tool call is logged with account, args, status; query via `audit_log_query`. Drop with `cleanup_audit_log`
+- **SPF / DKIM / DMARC** verdicts via `get_email_auth_results` (parses `Authentication-Results` headers per RFC 8601) -- useful for AI-assisted phishing classification
+- **bm25-weighted FTS5 ranking** -- subject hits outrank body hits which outrank address hits
+- **Thread tools** -- `extract_recipients_from_thread` (assemble reply-all lists) and `thread_summary` (LLM-friendly chronological summary)
+- **Paginated mailbox listing** -- `list_mailboxes` accepts `cursor`/`limit` for servers with thousands of folders
 - **Idempotent send/reply/forward** -- pass an `idempotencyKey` and a retry after a network blip won't re-send the message
 - **Attachment safety** -- `security.max_attachment_size_mb` (default 25 MB) is always enforced; opt-in `security.attachments_allowed_dirs` allowlist blocks prompt-injection from attaching files outside whitelisted folders (symlinks resolved before the check)
 - **HTML-only fallback** -- when an email has no `text/plain` part, the cache, FTS index and snippets are populated from `html2text`-converted HTML

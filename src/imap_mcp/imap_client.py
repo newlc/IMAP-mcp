@@ -31,6 +31,24 @@ from imapclient import IMAPClient
 logger_imap = logging.getLogger(__name__)
 
 
+def _normalize_delimiter(raw) -> str:
+    """Coerce an IMAP folder delimiter (bytes/str/None) into a non-empty str.
+
+    Some servers return ``None`` for the LIST/LSUB delimiter (especially
+    for the root namespace). MailboxInfo.delimiter is required, so default
+    to ``'/'`` -- it's the most common and the namespace-aware code paths
+    don't depend on the exact value here.
+    """
+    if raw is None:
+        return "/"
+    if isinstance(raw, bytes):
+        try:
+            return raw.decode("utf-8") or "/"
+        except UnicodeDecodeError:
+            return "/"
+    return str(raw) or "/"
+
+
 def _is_inside(child: Path, parent: Path) -> bool:
     """Return True if ``child`` is the same as or located under ``parent``.
 
@@ -58,6 +76,7 @@ from .mail_utils import (
     extract_inline_images,
     html_to_plain,
     inline_cid_to_data_uri,
+    parse_authentication_results,
     parse_calendar_invites,
     sanitize_html,
     with_retries,
@@ -249,18 +268,40 @@ class ImapClientWrapper:
 
     # === Mailbox Operations ===
 
-    def list_mailboxes(self, pattern: str = "*") -> list[MailboxInfo]:
-        """List all mailbox folders."""
+    def list_mailboxes(
+        self, pattern: str = "*",
+        cursor: int = 0, limit: Optional[int] = None,
+    ) -> dict:
+        """List all mailbox folders, optionally paginated.
+
+        Returns ``{"mailboxes": [...], "total": N, "next_cursor": K | None}``.
+        On servers with thousands of folders pass ``limit`` and use
+        ``next_cursor`` to page through them.
+        """
         self._ensure_connected()
         folders = self.client.list_folders(pattern=pattern)
-        return [
+        all_mailboxes = [
             MailboxInfo(
-                name=f[2],
-                delimiter=f[1],
-                flags=[str(flag) for flag in f[0]],
+                name=(f[2].decode() if isinstance(f[2], bytes) else f[2]),
+                delimiter=_normalize_delimiter(f[1]),
+                flags=[
+                    (fl.decode() if isinstance(fl, bytes) else str(fl))
+                    for fl in f[0]
+                ],
             )
             for f in folders
         ]
+        total = len(all_mailboxes)
+        if limit is None:
+            return {"mailboxes": all_mailboxes, "total": total, "next_cursor": None}
+        if cursor < 0:
+            raise ValueError("cursor must be >= 0")
+        if limit <= 0:
+            raise ValueError("limit must be > 0")
+        end = cursor + limit
+        page = all_mailboxes[cursor:end]
+        next_cursor: Optional[int] = end if end < total else None
+        return {"mailboxes": page, "total": total, "next_cursor": next_cursor}
 
     def select_mailbox(self, mailbox: str) -> MailboxStatus:
         """Select/open a mailbox folder.
@@ -1254,6 +1295,18 @@ class ImapClientWrapper:
             raise RuntimeError("Persistent cache is disabled.")
         return self.email_cache.vacuum()
 
+    def export_cache(self, passphrase: str, output_path: str) -> dict:
+        """Write a passphrase-protected, machine-portable cache snapshot."""
+        if not self.email_cache:
+            raise RuntimeError("Persistent cache is disabled.")
+        return self.email_cache.export_portable(passphrase, output_path)
+
+    def import_cache(self, passphrase: str, input_path: str) -> dict:
+        """Replace the live cache with the contents of a portable export."""
+        if not self.email_cache:
+            raise RuntimeError("Persistent cache is disabled.")
+        return self.email_cache.import_portable(passphrase, input_path)
+
     def rotate_encryption_key(self) -> dict:
         """Re-encrypt the on-disk cache with a fresh Fernet key.
 
@@ -1801,9 +1854,30 @@ class ImapClientWrapper:
         attachments: Optional[list[str]] = None,
         drafts_folder: str = "Drafts",
         include_signature: bool = True,
-    ) -> bool:
-        """Save email as draft (with optional file attachments)."""
+        idempotency_key: Optional[str] = None,
+    ) -> dict:
+        """Save email as draft (with optional file attachments).
+
+        Returns ``{"saved": True, "drafts_folder": ..., "idempotent_replay": bool}``.
+
+        With ``idempotency_key`` set and a persistent cache available, a
+        second call with the same key returns the prior result without
+        re-appending the draft -- avoids piling up duplicates if an agent
+        retries after a network blip.
+        """
         self._ensure_connected()
+
+        # Reuse sent_log for draft idempotency: prefix the key so it never
+        # collides with send_email's keyspace.
+        key = f"draft:{idempotency_key}" if idempotency_key else None
+        if key and self.email_cache:
+            previous = self.email_cache.lookup_sent(key)
+            if previous:
+                return {
+                    "saved": True,
+                    "drafts_folder": previous.get("saved_to_sent"),
+                    "idempotent_replay": True,
+                }
 
         msg = self._build_message(
             to=to,
@@ -1816,8 +1890,21 @@ class ImapClientWrapper:
             include_signature=include_signature,
             include_bcc_header=True,
         )
-        self._safe_append(drafts_folder, msg.as_bytes(), [b"\\Draft"])
-        return True
+        actual = self._safe_append(drafts_folder, msg.as_bytes(), [b"\\Draft"])
+
+        if key and self.email_cache:
+            try:
+                self.email_cache.record_sent(
+                    key, msg.get("Message-ID"),
+                    list(to or []) + list(cc or []) + list(bcc or []),
+                    subject, actual,
+                )
+            except Exception as exc:
+                logger_imap.warning(
+                    "save_draft succeeded but failed to record sent_log: %s", exc
+                )
+
+        return {"saved": True, "drafts_folder": actual, "idempotent_replay": False}
 
     # === Sending (write-mode) ===
 
@@ -2057,7 +2144,14 @@ class ImapClientWrapper:
             from_str = self._decode_header(orig.get("From", ""))
             date_str = orig.get("Date", "")
             if orig_body.text:
-                quoted_text = "\n".join("> " + line for line in orig_body.text.splitlines())
+                # Trim trailing whitespace per line and drop trailing blank
+                # lines so the quoted block doesn't end in a sea of bare ">"
+                # markers (common when the original body had a long signature
+                # padded with blank lines).
+                lines = [ln.rstrip() for ln in orig_body.text.splitlines()]
+                while lines and not lines[-1]:
+                    lines.pop()
+                quoted_text = "\n".join("> " + line for line in lines)
                 final_body = f"{body}\n\nOn {date_str}, {from_str} wrote:\n{quoted_text}"
             if html_body and (orig_body.html or orig_body.text):
                 inner_html = orig_body.html or (orig_body.text or "").replace("\n", "<br>")
@@ -2267,6 +2361,169 @@ class ImapClientWrapper:
                 {k: v for k, v in img.items() if k != "data_uri"}
                 for img in inline
             ],
+        }
+
+    def get_email_auth_results(
+        self, uid: int, mailbox: Optional[str] = None,
+    ) -> dict:
+        """Return SPF / DKIM / DMARC verdicts for an email.
+
+        Parses every ``Authentication-Results`` header (RFC 8601). Useful
+        for AI-assisted phishing classification: a mismatched From with
+        ``spf=fail`` and ``dmarc=fail`` is a strong red flag.
+        """
+        self._ensure_connected()
+        if mailbox:
+            self.select_mailbox(mailbox)
+        # Fetch only the Authentication-Results header field -- cheap.
+        try:
+            data = self.client.fetch(
+                [uid],
+                ["BODY.PEEK[HEADER.FIELDS (Authentication-Results)]"],
+            )
+        except Exception as exc:
+            return {"error": str(exc), "uid": uid}
+        if uid not in data:
+            return {"error": "not found", "uid": uid}
+
+        msg_data = data[uid]
+        raw = (
+            msg_data.get(b"BODY[HEADER.FIELDS (Authentication-Results)]")
+            or msg_data.get(b"BODY[HEADER.FIELDS (AUTHENTICATION-RESULTS)]")
+            or b""
+        )
+        if not raw:
+            return {"uid": uid, "raw": []}
+
+        parsed = email.message_from_bytes(raw)
+        values = parsed.get_all("Authentication-Results") or []
+        result = parse_authentication_results(values)
+        result["uid"] = uid
+        return result
+
+    def extract_recipients_from_thread(
+        self, uid: int, mailbox: Optional[str] = None,
+    ) -> dict:
+        """Collect every distinct address that appears in the thread.
+
+        Returns ``{"participants": [...], "by_role": {...}, "thread_size": N}``.
+        Each participant has ``email``, ``name``, ``role`` (the highest one
+        seen: from > to > cc), ``message_count``. The user's own address is
+        marked ``is_self: true``.
+        """
+        thread = self.get_thread(uid=uid, mailbox=mailbox)
+        user_email = (
+            self.config.get("user", {}).get("email")
+            or self.config.get("credentials", {}).get("username", "")
+        ).lower()
+
+        # role priority for "highest seen": from(3) > to(2) > cc(1)
+        role_priority = {"cc": 1, "to": 2, "from": 3}
+        agg: dict[str, dict] = {}
+
+        def _bump(addr: Optional[EmailAddress], role: str) -> None:
+            if not addr or not addr.email:
+                return
+            key = addr.email.lower()
+            entry = agg.setdefault(key, {
+                "email": addr.email,
+                "name": addr.name,
+                "role": role,
+                "message_count": 0,
+                "is_self": key == user_email,
+            })
+            if not entry["name"] and addr.name:
+                entry["name"] = addr.name
+            if role_priority[role] > role_priority[entry["role"]]:
+                entry["role"] = role
+            entry["message_count"] += 1
+
+        for h in thread:
+            _bump(h.from_address, "from")
+            for a in h.to_addresses:
+                _bump(a, "to")
+            for a in h.cc_addresses:
+                _bump(a, "cc")
+
+        participants = sorted(
+            agg.values(),
+            key=lambda p: (-p["message_count"], p["email"]),
+        )
+        by_role = {
+            "from": [p for p in participants if p["role"] == "from"],
+            "to": [p for p in participants if p["role"] == "to"],
+            "cc": [p for p in participants if p["role"] == "cc"],
+        }
+        return {
+            "participants": participants,
+            "by_role": by_role,
+            "thread_size": len(thread),
+        }
+
+    def thread_summary(
+        self, uid: int, mailbox: Optional[str] = None,
+    ) -> dict:
+        """Produce a compact, LLM-friendly summary of the whole thread.
+
+        Returns counts, span (oldest..newest dates), participants and a
+        chronological list of {uid, subject, from, date, unread}.
+        """
+        thread = self.get_thread(uid=uid, mailbox=mailbox)
+        if not thread:
+            return {
+                "thread_size": 0, "messages": [], "participants": [],
+            }
+
+        chronological = sorted(thread, key=lambda h: h.date or datetime.min)
+        oldest = chronological[0].date
+        newest = chronological[-1].date
+
+        user_email = (
+            self.config.get("user", {}).get("email")
+            or self.config.get("credentials", {}).get("username", "")
+        ).lower()
+
+        unread_count = sum(1 for h in thread if "\\Seen" not in h.flags)
+        from_self = sum(
+            1 for h in thread
+            if h.from_address and h.from_address.email.lower() == user_email
+        )
+        recipients_info = self.extract_recipients_from_thread(uid=uid, mailbox=mailbox)
+
+        # Use the most-recent non-Re/Fwd subject as the canonical thread title.
+        title = next(
+            (
+                h.subject for h in reversed(chronological)
+                if h.subject
+            ), None
+        ) or "(no subject)"
+
+        messages = [
+            {
+                "uid": h.uid,
+                "subject": h.subject,
+                "from": h.from_address.email if h.from_address else None,
+                "from_name": h.from_address.name if h.from_address else None,
+                "date": h.date.isoformat() if h.date else None,
+                "unread": "\\Seen" not in h.flags,
+                "from_self": (
+                    h.from_address is not None
+                    and h.from_address.email.lower() == user_email
+                ),
+            }
+            for h in chronological
+        ]
+        return {
+            "title": title,
+            "thread_size": len(thread),
+            "unread_count": unread_count,
+            "messages_from_self": from_self,
+            "span": {
+                "oldest": oldest.isoformat() if oldest else None,
+                "newest": newest.isoformat() if newest else None,
+            },
+            "participants": recipients_info["participants"],
+            "messages": messages,
         }
 
     def get_calendar_invites(
@@ -3211,12 +3468,19 @@ class ImapClientWrapper:
                     "subject": subject[:100],
                 })
 
-        # Move emails if not dry run
+        # Move emails if not dry run -- batched to avoid huge UID-list
+        # commands that can blow IMAP command-length limits on large
+        # mailboxes (50K UIDs in one MOVE is rejected by some servers).
         if to_archive and not dry_run:
-            try:
-                self.client.move(to_archive, archive_folder)
-            except Exception as e:
-                errors.append(f"Failed to move emails: {str(e)}")
+            batch_size = 1000
+            for i in range(0, len(to_archive), batch_size):
+                chunk = to_archive[i:i + batch_size]
+                try:
+                    self.client.move(chunk, archive_folder)
+                except Exception as e:
+                    errors.append(
+                        f"Failed to move batch starting at index {i}: {e}"
+                    )
 
         return {
             "archived_count": len(to_archive),

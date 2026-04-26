@@ -20,8 +20,17 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+import base64
+
 import keyring
 from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
+# File format magic for portable cache snapshots.
+_PORTABLE_MAGIC = b"IMAPMCP1\n"
+_PBKDF2_ITERATIONS = 600_000
+_SALT_BYTES = 16
 
 _KEYRING_SERVICE = "imap-mcp-cache"
 _KEYRING_USERNAME_DEFAULT = "encryption-key"
@@ -88,6 +97,20 @@ CREATE TABLE IF NOT EXISTS sent_log (
     saved_to_sent   TEXT,
     sent_at         TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS audit_log (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts        TEXT NOT NULL,
+    account   TEXT,
+    tool      TEXT NOT NULL,
+    write     INTEGER NOT NULL DEFAULT 0,
+    args      TEXT,
+    status    TEXT NOT NULL,
+    error     TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts);
+CREATE INDEX IF NOT EXISTS idx_audit_tool ON audit_log(tool);
 """
 
 
@@ -369,21 +392,32 @@ class EmailCache:
         mailbox: Optional[str] = None,
         limit: int = 50,
     ) -> list[dict]:
-        """Run an FTS5 MATCH query, returning email rows joined with metadata."""
+        """Run an FTS5 MATCH query, returning email rows joined with metadata.
+
+        Uses weighted bm25 ranking: subject hits count more than body hits,
+        which in turn count more than from/to address hits. Weights match
+        the column order of ``emails_fts``: (mailbox, uid, subject, body,
+        from_address, to_address) -- mailbox/uid columns are UNINDEXED so
+        their weights are ignored.
+        """
+        # bm25 weights: (mailbox, uid, subject=5.0, body=1.0, from=2.0, to=1.0)
+        rank_expr = "bm25(emails_fts, 1.0, 1.0, 5.0, 1.0, 2.0, 1.0)"
         if mailbox:
             sql = (
-                "SELECT e.* FROM emails_fts f "
+                f"SELECT e.*, {rank_expr} AS rank "
+                "FROM emails_fts f "
                 "JOIN emails e ON e.mailbox = f.mailbox AND e.uid = f.uid "
                 "WHERE emails_fts MATCH ? AND f.mailbox = ? "
-                "ORDER BY rank LIMIT ?"
+                f"ORDER BY {rank_expr} LIMIT ?"
             )
             rows = self.conn.execute(sql, (query, mailbox, limit)).fetchall()
         else:
             sql = (
-                "SELECT e.* FROM emails_fts f "
+                f"SELECT e.*, {rank_expr} AS rank "
+                "FROM emails_fts f "
                 "JOIN emails e ON e.mailbox = f.mailbox AND e.uid = f.uid "
                 "WHERE emails_fts MATCH ? "
-                "ORDER BY rank LIMIT ?"
+                f"ORDER BY {rank_expr} LIMIT ?"
             )
             rows = self.conn.execute(sql, (query, limit)).fetchall()
         return [dict(r) for r in rows]
@@ -641,6 +675,77 @@ class EmailCache:
         self._auto_flush()
 
     # ------------------------------------------------------------------
+    # Audit log
+    # ------------------------------------------------------------------
+
+    def record_audit(
+        self,
+        account: Optional[str],
+        tool: str,
+        write: bool,
+        args: Optional[dict],
+        status: str,
+        error: Optional[str] = None,
+    ) -> None:
+        """Record one tool invocation to the audit log."""
+        try:
+            args_json = (
+                json.dumps(args, ensure_ascii=False, default=str)
+                if args is not None else None
+            )
+        except (TypeError, ValueError):
+            args_json = "<unserializable>"
+        self.conn.execute(
+            "INSERT INTO audit_log (ts, account, tool, write, args, status, error) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                datetime.now().isoformat(),
+                account, tool, 1 if write else 0,
+                args_json, status, error,
+            ),
+        )
+        self.conn.commit()
+        self._auto_flush()
+
+    def query_audit_log(
+        self,
+        limit: int = 100,
+        tool: Optional[str] = None,
+        write_only: bool = False,
+        since: Optional[str] = None,
+    ) -> list[dict]:
+        """Read recent audit entries, newest first."""
+        sql = "SELECT * FROM audit_log WHERE 1=1"
+        params: list = []
+        if tool:
+            sql += " AND tool = ?"
+            params.append(tool)
+        if write_only:
+            sql += " AND write = 1"
+        if since:
+            sql += " AND ts >= ?"
+            params.append(since)
+        sql += " ORDER BY ts DESC LIMIT ?"
+        params.append(int(limit))
+        rows = self.conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def cleanup_audit_log(self, older_than_days: int = 90) -> dict:
+        """Drop audit_log rows older than ``older_than_days`` days."""
+        if older_than_days < 0:
+            raise ValueError("older_than_days must be >= 0")
+        from datetime import timedelta
+        cutoff = (datetime.now() - timedelta(days=older_than_days)).isoformat()
+        cur = self.conn.execute("DELETE FROM audit_log WHERE ts < ?", (cutoff,))
+        deleted = cur.rowcount
+        remaining = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM audit_log"
+        ).fetchone()["c"]
+        self.conn.commit()
+        self._auto_flush()
+        return {"deleted": int(deleted or 0), "remaining": int(remaining), "cutoff": cutoff}
+
+    # ------------------------------------------------------------------
     # Maintenance: VACUUM, sent_log cleanup, key rotation
     # ------------------------------------------------------------------
 
@@ -695,6 +800,132 @@ class EmailCache:
             "size_before_bytes": size_before,
             "size_after_bytes": size_after,
             "saved_bytes": max(0, size_before - size_after),
+        }
+
+    @staticmethod
+    def _derive_key(passphrase: str, salt: bytes) -> bytes:
+        """PBKDF2-HMAC-SHA256 -> URL-safe base64 Fernet key."""
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            iterations=_PBKDF2_ITERATIONS,
+        )
+        raw = kdf.derive(passphrase.encode("utf-8"))
+        return base64.urlsafe_b64encode(raw)
+
+    def export_portable(self, passphrase: str, output_path: str) -> dict:
+        """Write a passphrase-protected, machine-portable copy of the cache.
+
+        File layout::
+
+            IMAPMCP1\\n
+            <base64 salt>\\n
+            <base64 ciphertext>
+
+        The plaintext is the raw SQLite database (always, regardless of
+        whether the live cache is encrypted on disk). Decrypt on the
+        target machine with the same passphrase via :meth:`import_portable`.
+        """
+        if not passphrase:
+            raise ValueError("Passphrase is required to export the cache.")
+
+        # Materialize the current DB to plain bytes.
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
+        try:
+            tmp.close()
+            file_conn = sqlite3.connect(tmp.name)
+            self.conn.commit()
+            self.conn.backup(file_conn)
+            file_conn.close()
+            with open(tmp.name, "rb") as f:
+                plaintext = f.read()
+        finally:
+            os.unlink(tmp.name)
+
+        salt = os.urandom(_SALT_BYTES)
+        key = self._derive_key(passphrase, salt)
+        ciphertext = Fernet(key).encrypt(plaintext)
+
+        out_path = os.path.expanduser(output_path)
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "wb") as f:
+            f.write(_PORTABLE_MAGIC)
+            f.write(base64.b64encode(salt) + b"\n")
+            f.write(base64.b64encode(ciphertext))
+
+        return {
+            "exported": True,
+            "path": out_path,
+            "size_bytes": os.path.getsize(out_path),
+            "rows": self.conn.execute(
+                "SELECT COUNT(*) AS c FROM emails"
+            ).fetchone()["c"],
+        }
+
+    def import_portable(self, passphrase: str, input_path: str) -> dict:
+        """Replace the cache contents with the contents of a portable export.
+
+        The current cache is wiped first; the import is atomic (either it
+        all loads or none of it does).
+        """
+        if not passphrase:
+            raise ValueError("Passphrase is required to import the cache.")
+
+        in_path = os.path.expanduser(input_path)
+        with open(in_path, "rb") as f:
+            data = f.read()
+
+        if not data.startswith(_PORTABLE_MAGIC):
+            raise ValueError(
+                "File does not look like an IMAPMCP1 portable export."
+            )
+        body = data[len(_PORTABLE_MAGIC):]
+        try:
+            salt_b64, ciphertext_b64 = body.split(b"\n", 1)
+            salt = base64.b64decode(salt_b64)
+            ciphertext = base64.b64decode(ciphertext_b64)
+        except (ValueError, IndexError) as exc:
+            raise ValueError(f"Malformed portable export: {exc}")
+
+        key = self._derive_key(passphrase, salt)
+        try:
+            plaintext = Fernet(key).decrypt(ciphertext)
+        except Exception as exc:
+            raise ValueError(
+                "Decryption failed -- wrong passphrase or corrupted file."
+            ) from exc
+
+        # Load the imported DB into the live connection via the SQLite
+        # online backup API. Wipe the destination first so we get an exact
+        # replacement, not a merge.
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
+        try:
+            tmp.write(plaintext)
+            tmp.close()
+            src_conn = sqlite3.connect(tmp.name)
+            # Drop everything on the destination before backup-replacing.
+            self.conn.executescript(
+                "DROP TABLE IF EXISTS emails_fts; "
+                "DROP TABLE IF EXISTS attachments; "
+                "DROP TABLE IF EXISTS emails; "
+                "DROP TABLE IF EXISTS mailbox_meta; "
+                "DROP TABLE IF EXISTS sent_log;"
+            )
+            self.conn.commit()
+            src_conn.backup(self.conn)
+            src_conn.close()
+        finally:
+            os.unlink(tmp.name)
+
+        self.conn.commit()
+        self._auto_flush()
+        return {
+            "imported": True,
+            "path": in_path,
+            "rows": self.conn.execute(
+                "SELECT COUNT(*) AS c FROM emails"
+            ).fetchone()["c"],
         }
 
     def rotate_encryption_key(self) -> dict:
