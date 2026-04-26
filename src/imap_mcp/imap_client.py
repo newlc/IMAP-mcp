@@ -41,6 +41,13 @@ from .models import (
     AutoArchiveSender,
 )
 from .cache import EmailCache
+from .mail_utils import (
+    extract_inline_images,
+    inline_cid_to_data_uri,
+    parse_calendar_invites,
+    sanitize_html,
+    with_retries,
+)
 from .watcher import ImapWatcher
 
 KEYRING_SERVICE = "imap-mcp"
@@ -99,8 +106,10 @@ class ImapClientWrapper:
         return self.config
 
     def connect(self, host: str, port: int = 993, secure: bool = True) -> bool:
-        """Establish IMAP connection."""
-        self.client = IMAPClient(host, port=port, ssl=secure)
+        """Establish IMAP connection. Retries on transient network errors."""
+        self.client = with_retries(
+            lambda: IMAPClient(host, port=port, ssl=secure)
+        )
         return True
 
     def authenticate(self, username: str, password: str) -> bool:
@@ -1746,21 +1755,26 @@ class ImapClientWrapper:
 
         username, password = self._resolve_smtp_password()
 
-        if smtp_secure:
-            ctx = ssl.create_default_context()
-            smtp = smtplib.SMTP_SSL(smtp_host, smtp_port, context=ctx)
-        else:
-            smtp = smtplib.SMTP(smtp_host, smtp_port)
-            if smtp_starttls:
-                smtp.starttls(context=ssl.create_default_context())
-        try:
-            smtp.login(username, password)
-            smtp.sendmail(from_addr, recipients, msg_bytes)
-        finally:
+        def _send_once():
+            if smtp_secure:
+                ctx = ssl.create_default_context()
+                conn = smtplib.SMTP_SSL(smtp_host, smtp_port, context=ctx)
+            else:
+                conn = smtplib.SMTP(smtp_host, smtp_port)
+                if smtp_starttls:
+                    conn.starttls(context=ssl.create_default_context())
             try:
-                smtp.quit()
-            except Exception:
-                pass
+                conn.login(username, password)
+                conn.sendmail(from_addr, recipients, msg_bytes)
+            finally:
+                try:
+                    conn.quit()
+                except Exception:
+                    pass
+
+        # Retry on transient network errors only -- SMTP auth failures and
+        # 5xx replies will surface on the first attempt and propagate.
+        with_retries(_send_once)
 
     def send_email(
         self,
@@ -2065,6 +2079,319 @@ class ImapClientWrapper:
             else:
                 raise
         return {"deleted": len(uids), "permanent": False, "moved_to": moved_to}
+
+    # === HTML rendering / inline images / calendar ======================
+
+    def get_email_body_safe(
+        self,
+        uid: int,
+        mailbox: Optional[str] = None,
+        strip_remote_images: bool = False,
+        strip_links: bool = False,
+        inline_cid_images: bool = True,
+    ) -> dict:
+        """Return a sanitized HTML body with optional inline-image inlining.
+
+        Returns ``{"html": ..., "text": ..., "inline_images": [...]}``. The
+        HTML has been passed through bleach with a conservative whitelist:
+        ``<script>``, ``<style>``, ``<iframe>``, event handlers and
+        ``javascript:`` URLs are removed. With ``inline_cid_images=True``
+        every ``src="cid:..."`` reference is replaced by a ``data:`` URI so
+        the HTML renders standalone.
+        """
+        self._ensure_connected()
+        if mailbox:
+            self.select_mailbox(mailbox)
+
+        data = self.client.fetch([uid], ["BODY[]"])
+        if uid not in data:
+            raise ValueError(f"Email with UID {uid} not found")
+        msg = email.message_from_bytes(data[uid].get(b"BODY[]", b""))
+
+        body = self._extract_body(msg)
+        inline = extract_inline_images(msg) if inline_cid_images else []
+        html = body.html or ""
+        if inline_cid_images and inline:
+            html = inline_cid_to_data_uri(html, inline)
+        clean = sanitize_html(
+            html,
+            strip_remote_images=strip_remote_images,
+            strip_links=strip_links,
+        ) if html else ""
+        return {
+            "uid": uid,
+            "html": clean,
+            "text": body.text or "",
+            "inline_images": [
+                {k: v for k, v in img.items() if k != "data_uri"}
+                for img in inline
+            ],
+        }
+
+    def get_calendar_invites(
+        self, uid: int, mailbox: Optional[str] = None
+    ) -> list[dict]:
+        """Return parsed VEVENTs from any ``text/calendar`` parts of an email."""
+        self._ensure_connected()
+        if mailbox:
+            self.select_mailbox(mailbox)
+
+        data = self.client.fetch([uid], ["BODY[]"])
+        if uid not in data:
+            raise ValueError(f"Email with UID {uid} not found")
+        msg = email.message_from_bytes(data[uid].get(b"BODY[]", b""))
+        return parse_calendar_invites(msg)
+
+    # === AI-friendly summaries ==========================================
+
+    def get_email_summary(
+        self,
+        uids: list[int],
+        mailbox: Optional[str] = None,
+        body_chars: int = 300,
+    ) -> list[dict]:
+        """Return a compact summary list for ``uids`` -- cheap LLM-friendly.
+
+        Each entry has subject, sender, date, flags, size, has_attachments
+        and the first ``body_chars`` of the plain-text body. Bodies are
+        served from cache when available so a 50-email overview costs zero
+        IMAP body fetches the second time around.
+        """
+        self._ensure_connected()
+        if mailbox:
+            self.select_mailbox(mailbox)
+        effective_mailbox = mailbox or self.current_mailbox or "INBOX"
+
+        if not uids:
+            return []
+
+        # Split: which uids do we already have cached?
+        cached_summaries: dict[int, dict] = {}
+        uids_need_body: list[int] = []
+        if self.email_cache:
+            for u in uids:
+                row = self.email_cache.get_email(effective_mailbox, u)
+                if row and row.get("has_body"):
+                    cached_summaries[u] = self._row_to_summary(row, body_chars)
+                else:
+                    uids_need_body.append(u)
+        else:
+            uids_need_body = list(uids)
+
+        if uids_need_body:
+            # One round trip with BODYSTRUCTURE so we know who has attachments,
+            # and BODY.PEEK[TEXT] for the plain-text snippet without setting \\Seen.
+            fields = ["ENVELOPE", "FLAGS", "RFC822.SIZE", "BODYSTRUCTURE",
+                      "BODY.PEEK[TEXT]"]
+            messages = self.client.fetch(uids_need_body, fields)
+            for u, d in messages.items():
+                hdr = self._parse_email_header(u, d)
+                bs = d.get(b"BODYSTRUCTURE")
+                has_att = self._bodystructure_has_attachment(bs)
+                raw_text = d.get(b"BODY[TEXT]") or b""
+                text = raw_text.decode("utf-8", errors="replace") if raw_text else ""
+                cached_summaries[u] = {
+                    "uid": u,
+                    "subject": hdr.subject,
+                    "sender": (hdr.from_address.email if hdr.from_address else None),
+                    "sender_name": (hdr.from_address.name if hdr.from_address else None),
+                    "date": hdr.date.isoformat() if hdr.date else None,
+                    "flags": hdr.flags,
+                    "unread": "\\Seen" not in hdr.flags,
+                    "size": hdr.size,
+                    "has_attachments": has_att,
+                    "snippet": (text[:body_chars] + "…") if len(text) > body_chars else text,
+                }
+
+        # Preserve input order.
+        return [cached_summaries[u] for u in uids if u in cached_summaries]
+
+    @staticmethod
+    def _row_to_summary(row: dict, body_chars: int) -> dict:
+        """Build a summary dict directly from a cached emails row."""
+        text = row.get("body_text") or ""
+        flags = []
+        try:
+            flags = json.loads(row.get("flags") or "[]")
+        except (TypeError, ValueError):
+            flags = []
+        return {
+            "uid": row["uid"],
+            "subject": row.get("subject"),
+            "sender": row.get("from_email"),
+            "sender_name": row.get("from_name"),
+            "date": row.get("date"),
+            "flags": flags,
+            "unread": "\\Seen" not in flags,
+            "size": row.get("size"),
+            "has_attachments": False,  # cache layer doesn't track this directly
+            "snippet": (text[:body_chars] + "…") if len(text) > body_chars else text,
+        }
+
+    # === Bulk operations by query =======================================
+
+    BULK_ACTIONS = {
+        "mark_read", "mark_unread", "flag", "unflag", "archive", "delete",
+        "move", "copy", "report_spam",
+    }
+
+    def bulk_action(
+        self,
+        action: str,
+        query: Optional[list] = None,
+        mailbox: Optional[str] = None,
+        from_addr: Optional[str] = None,
+        subject: Optional[str] = None,
+        since: Optional[str] = None,
+        before: Optional[str] = None,
+        unread: Optional[bool] = None,
+        flagged: Optional[bool] = None,
+        # Action-specific
+        destination: Optional[str] = None,
+        flag_name: Optional[str] = None,
+        permanent: bool = False,
+        dry_run: bool = False,
+    ) -> dict:
+        """Apply ``action`` to every message matching the search criteria.
+
+        ``action`` is one of :data:`BULK_ACTIONS`. Search criteria mirror the
+        parameters of :meth:`search_advanced` (in addition to a free-form
+        ``query`` list of IMAP SEARCH tokens). With ``dry_run=True`` the
+        message is matched but no mutation is performed -- useful as a
+        preview.
+
+        Returns ``{"action", "matched", "affected", "uids", "dry_run", ...}``.
+        """
+        if action not in self.BULK_ACTIONS:
+            raise ValueError(
+                f"Unknown bulk action: {action!r}. Allowed: {sorted(self.BULK_ACTIONS)}"
+            )
+
+        self._ensure_connected()
+        if mailbox:
+            self.select_mailbox(mailbox)
+        elif not self.current_mailbox:
+            self.select_mailbox("INBOX")
+
+        criteria: list = list(query) if query else []
+        if unread is True:
+            criteria.append("UNSEEN")
+        elif unread is False:
+            criteria.append("SEEN")
+        if flagged is True:
+            criteria.append("FLAGGED")
+        elif flagged is False:
+            criteria.append("UNFLAGGED")
+        if from_addr:
+            criteria.extend(["FROM", from_addr])
+        if subject:
+            criteria.extend(["SUBJECT", subject])
+        if since:
+            criteria.extend(["SINCE", self._to_imap_date(since)])
+        if before:
+            criteria.extend(["BEFORE", self._to_imap_date(before)])
+        if not criteria:
+            criteria = ["ALL"]
+
+        try:
+            uids = self.client.search(criteria, charset="UTF-8")
+        except Exception:
+            uids = self.client.search(criteria)
+
+        if not uids:
+            return {
+                "action": action, "matched": 0, "affected": 0,
+                "uids": [], "dry_run": dry_run, "mailbox": self.current_mailbox,
+            }
+
+        result: dict = {
+            "action": action,
+            "matched": len(uids),
+            "uids": list(uids),
+            "dry_run": dry_run,
+            "mailbox": self.current_mailbox,
+        }
+
+        if dry_run:
+            result["affected"] = 0
+            return result
+
+        if action == "mark_read":
+            self.client.add_flags(uids, [b"\\Seen"])
+        elif action == "mark_unread":
+            self.client.remove_flags(uids, [b"\\Seen"])
+        elif action == "flag":
+            self.client.add_flags(uids, [(flag_name or "\\Flagged").encode()])
+        elif action == "unflag":
+            self.client.remove_flags(uids, [(flag_name or "\\Flagged").encode()])
+        elif action == "archive":
+            self.archive_email(
+                uids=list(uids),
+                archive_folder=destination
+                or self.config.get("folders", {}).get("archive", "Archive"),
+            )
+        elif action == "move":
+            if not destination:
+                raise ValueError("bulk_action(action='move') requires 'destination'.")
+            self.move_email(uids=list(uids), destination=destination)
+        elif action == "copy":
+            if not destination:
+                raise ValueError("bulk_action(action='copy') requires 'destination'.")
+            self.copy_email(uids=list(uids), destination=destination)
+        elif action == "delete":
+            res = self.delete_email(
+                uids=list(uids),
+                permanent=permanent,
+                trash_folder=destination,
+            )
+            result.update({k: res[k] for k in ("permanent", "moved_to") if k in res})
+        elif action == "report_spam":
+            res = self.report_spam(uids=list(uids), spam_folder=destination)
+            result.update({k: res[k] for k in ("moved_to", "flag") if k in res})
+
+        result["affected"] = len(uids)
+        return result
+
+    # === Account health =================================================
+
+    def health_check(self) -> dict:
+        """Light-weight reachability check for this account.
+
+        Tries to issue a NOOP if connected, otherwise just reports status.
+        Doesn't open a new connection -- intended to be called by the
+        ``accounts_health`` server-level tool, which inspects every account
+        without forcing a connect.
+        """
+        if not self.client:
+            return {
+                "connected": False,
+                "ok": False,
+                "reason": "not connected",
+            }
+        try:
+            self.client.noop()
+        except Exception as exc:
+            return {
+                "connected": True,
+                "ok": False,
+                "reason": str(exc),
+            }
+        cache_stats = None
+        if self.email_cache:
+            try:
+                cache_stats = {
+                    "emails_cached": self.email_cache.get_cached_count("INBOX"),
+                    "encrypted": self.email_cache.encrypted,
+                }
+            except Exception:
+                cache_stats = None
+        return {
+            "connected": True,
+            "ok": True,
+            "current_mailbox": self.current_mailbox,
+            "watching": self.watching,
+            "cache": cache_stats,
+        }
 
     # === Draft management ================================================
 

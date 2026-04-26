@@ -128,6 +128,14 @@ async def list_tools() -> list[Tool]:
             multi_account=False,
         ),
         make_tool(
+            "accounts_health",
+            "Per-account reachability check (NOOP on the IMAP socket, cache "
+            "status, watcher state). Does not open new connections -- only "
+            "checks accounts that are already connected.",
+            {},
+            multi_account=False,
+        ),
+        make_tool(
             "disconnect",
             "Close the IMAP connection for one account, or all accounts when "
             "called without 'account'.",
@@ -630,6 +638,77 @@ async def list_tools() -> list[Tool]:
             },
             ["uids"],
         ),
+        # === HTML safety / inline images / calendar ===
+        make_tool(
+            "get_email_body_safe",
+            "Return a sanitized HTML body (script/style/iframe stripped, "
+            "javascript: URLs removed, style attribute filtered) plus the "
+            "plain-text body and any inline cid: images. With "
+            "inline_cid_images=true the HTML's cid: refs are replaced by "
+            "data: URIs so the snippet renders standalone.",
+            {
+                "uid": {"type": "number", "description": "Email UID"},
+                "mailbox": {"type": "string", "description": "Mailbox (default: current)"},
+                "strip_remote_images": {"type": "boolean", "description": "Drop <img> tags whose src is not cid: (blocks tracking pixels)"},
+                "strip_links": {"type": "boolean", "description": "Replace every href with #"},
+                "inline_cid_images": {"type": "boolean", "description": "Replace cid: refs with data: URIs (default: true)"},
+            },
+            ["uid"],
+        ),
+        make_tool(
+            "get_calendar_invites",
+            "Parse text/calendar parts in an email and return one entry per "
+            "VEVENT (method, uid, summary, start, end, organizer, attendees, "
+            "...). Returns [] if there is no calendar part.",
+            {
+                "uid": {"type": "number", "description": "Email UID"},
+                "mailbox": {"type": "string", "description": "Mailbox (default: current)"},
+            },
+            ["uid"],
+        ),
+        # === Compact summaries ===
+        make_tool(
+            "get_email_summary",
+            "Return a compact AI-friendly summary list (subject, sender, "
+            "date, flags, snippet, has_attachments) for the given UIDs in a "
+            "single round trip. Bodies are served from cache when present.",
+            {
+                "uids": {
+                    "type": "array", "items": {"type": "number"},
+                    "description": "Email UIDs to summarize",
+                },
+                "mailbox": {"type": "string", "description": "Mailbox (default: current)"},
+                "body_chars": {"type": "number", "description": "Max plain-text snippet length (default: 300)"},
+            },
+            ["uids"],
+        ),
+        # === Bulk operations by query ===
+        make_tool(
+            "bulk_action",
+            "Apply one action to every message matching the search criteria. "
+            "Supported actions: mark_read, mark_unread, flag, unflag, archive, "
+            "delete, move, copy, report_spam. Use dry_run=true to preview.",
+            {
+                "action": {
+                    "type": "string",
+                    "enum": ["mark_read", "mark_unread", "flag", "unflag",
+                             "archive", "delete", "move", "copy", "report_spam"],
+                    "description": "Action to apply",
+                },
+                "mailbox": {"type": "string", "description": "Source mailbox (default: current)"},
+                "from_addr": {"type": "string", "description": "Filter by sender"},
+                "subject": {"type": "string", "description": "Filter by subject substring"},
+                "since": {"type": "string", "description": "ISO date (inclusive)"},
+                "before": {"type": "string", "description": "ISO date (exclusive)"},
+                "unread": {"type": "boolean", "description": "Only unread / read"},
+                "flagged": {"type": "boolean", "description": "Only flagged / unflagged"},
+                "destination": {"type": "string", "description": "Required for move/copy; overrides default folder for archive/delete/report_spam"},
+                "flag_name": {"type": "string", "description": "Used by flag/unflag (default: \\Flagged)"},
+                "permanent": {"type": "boolean", "description": "For delete: \\Deleted+EXPUNGE instead of moving to Trash"},
+                "dry_run": {"type": "boolean", "description": "Match without mutating (default: false)"},
+            },
+            ["action"],
+        ),
         # === Search (advanced + FTS) ===
         make_tool(
             "search_advanced",
@@ -910,6 +989,14 @@ async def handle_tool_call(name: str, args: dict) -> Any:
             "Restart imap-mcp with --write to enable destructive operations."
         )
 
+    # bulk_action covers many actions; gate the destructive ones individually.
+    if name == "bulk_action" and not _write_enabled:
+        if args.get("action") == "delete":
+            raise PermissionError(
+                "bulk_action(action='delete') is disabled in read-only mode. "
+                "Restart imap-mcp with --write."
+            )
+
     account = args.get("account")
 
     # ------------------------------------------------------------------
@@ -925,6 +1012,17 @@ async def handle_tool_call(name: str, args: dict) -> Any:
         }
     elif name == "list_accounts":
         return account_manager.list_accounts()
+    elif name == "accounts_health":
+        out = []
+        for acct in account_manager.accounts.values():
+            try:
+                health = acct.client.health_check() if acct._connected else {
+                    "connected": False, "ok": False, "reason": "not connected (lazy)",
+                }
+            except Exception as exc:
+                health = {"connected": False, "ok": False, "reason": str(exc)}
+            out.append({"name": acct.name, **health})
+        return out
     elif name == "disconnect":
         if account:
             account_manager.get_account(account).disconnect()
@@ -999,6 +1097,39 @@ async def handle_tool_call(name: str, args: dict) -> Any:
         }
     elif name == "get_thread":
         return cli.get_thread(uid=args["uid"], mailbox=args.get("mailbox"))
+    elif name == "get_email_body_safe":
+        return cli.get_email_body_safe(
+            uid=args["uid"],
+            mailbox=args.get("mailbox"),
+            strip_remote_images=args.get("strip_remote_images", False),
+            strip_links=args.get("strip_links", False),
+            inline_cid_images=args.get("inline_cid_images", True),
+        )
+    elif name == "get_calendar_invites":
+        return cli.get_calendar_invites(
+            uid=args["uid"], mailbox=args.get("mailbox")
+        )
+    elif name == "get_email_summary":
+        return cli.get_email_summary(
+            uids=args["uids"],
+            mailbox=args.get("mailbox"),
+            body_chars=args.get("body_chars", 300),
+        )
+    elif name == "bulk_action":
+        return cli.bulk_action(
+            action=args["action"],
+            mailbox=args.get("mailbox"),
+            from_addr=args.get("from_addr"),
+            subject=args.get("subject"),
+            since=args.get("since"),
+            before=args.get("before"),
+            unread=args.get("unread"),
+            flagged=args.get("flagged"),
+            destination=args.get("destination"),
+            flag_name=args.get("flag_name"),
+            permanent=args.get("permanent", False),
+            dry_run=args.get("dry_run", False),
+        )
 
     # ------------------------------------------------------------------
     # Search

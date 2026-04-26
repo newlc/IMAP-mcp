@@ -26,6 +26,8 @@ dependencies = [
     "pydantic>=2.0.0",
     "keyring>=25.0.0",
     "cryptography>=43.0.0",
+    "bleach[css]>=6.0.0",
+    "icalendar>=5.0.0",
 ]
 
 [project.optional-dependencies]

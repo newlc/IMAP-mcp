@@ -375,7 +375,7 @@ class TestWriteModeGating:
     def test_every_tool_advertises_account_param(self):
         srv._write_enabled = True
         tools = asyncio.run(srv.list_tools())
-        global_tools = {"auto_connect", "list_accounts", "disconnect"}
+        global_tools = {"auto_connect", "list_accounts", "disconnect", "accounts_health"}
         for t in tools:
             if t.name in global_tools:
                 continue

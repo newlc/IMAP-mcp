@@ -27,6 +27,13 @@ The local cache turns your mailbox into a queryable database that AI assistants 
 - **Drafts** -- save, update, delete (with file attachments)
 - **Server-side rules via ManageSieve** (RFC 5804) -- list, get, check, put, delete, activate Sieve scripts
 - **Spam handling** -- `report_spam`/`mark_not_spam` (move + `$Junk`/`$NotJunk` keywords for filter training)
+- **Safe HTML rendering** -- `get_email_body_safe` runs bleach with a tight whitelist, drops `<script>`/`<style>`/event handlers/`javascript:` URLs, optionally blocks remote images and rewrites links
+- **Inline `cid:` images** are extracted and inlined as `data:` URIs so HTML bodies render standalone
+- **Calendar invites** -- `get_calendar_invites` parses `text/calendar` parts (method, organizer, attendees, start/end, location)
+- **AI-friendly summaries** -- `get_email_summary(uids[])` returns one compact list (subject, sender, date, snippet, has_attachments) in a single round trip
+- **Bulk operations by query** -- `bulk_action(action, …)` matches messages by sender/subject/date/unread/flagged in one call and applies mark_read, flag, archive, move, copy, delete, or report_spam
+- **Transient-error retries** -- IMAP connect and SMTP send retry on timeouts and connection drops with exponential backoff
+- **Per-account health check** -- `accounts_health` issues a NOOP per connected account and reports cache state
 - **Real threading** -- IMAP `THREAD REFERENCES` with cached `Message-ID`/`References` fallback
 - **Full-text search** -- SQLite FTS5 index over cached subjects, bodies, and addresses; combined IMAP `SEARCH` with multiple criteria
 - **Server metadata** -- `CAPABILITY`, `NAMESPACE`, `QUOTA`, `ID`
@@ -431,14 +438,17 @@ Use `get_cache_stats` to see how many emails are cached, database size, and encr
 | `delete_mailbox` *(--write)* | Delete a folder |
 | `empty_mailbox` *(--write)* | Wipe every message in a folder (`\Deleted` + `EXPUNGE`) |
 
-### Email reading (7 tools)
+### Email reading (10 tools)
 
 | Tool | Description |
 |------|-------------|
 | `fetch_emails` | Fetch emails with limit/offset, date filters |
 | `get_email` | Get complete email (headers + body + attachments) by UID |
 | `get_email_headers` | Get headers only (faster) |
-| `get_email_body` | Get body as text or HTML |
+| `get_email_body` | Get body as text or HTML (raw) |
+| `get_email_body_safe` | Sanitized HTML (bleach) with optional remote-image / link stripping; cid: inline images replaced with data: URIs |
+| `get_email_summary` | Compact AI-friendly summary list for many UIDs in one call |
+| `get_calendar_invites` | Parse text/calendar parts (method, organizer, attendees, start/end) |
 | `get_attachments` | List attachment metadata |
 | `download_attachment` | Download attachment content (base64) |
 | `get_thread` | Get email conversation thread |
@@ -473,6 +483,7 @@ Use `get_cache_stats` to see how many emails are cached, database size, and encr
 | `delete_draft` | Permanently delete one draft from the Drafts folder |
 | `report_spam` | Move to Spam folder + add `$Junk` keyword (trains server-side filters) |
 | `mark_not_spam` | Move out of Spam, clear `$Junk`, set `$NotJunk` |
+| `bulk_action` | Apply one action (mark_read/flag/archive/move/copy/delete/report_spam) to every UID matching from/subject/date/unread/flagged criteria, with `dry_run` |
 
 ### Write-mode actions (4 tools, require `--write`)
 
@@ -526,6 +537,7 @@ Use `get_cache_stats` to see how many emails are cached, database size, and encr
 | `get_namespace` | IMAP `NAMESPACE` (personal/other/shared prefixes) |
 | `get_quota` | IMAP `QUOTA` usage for a mailbox |
 | `get_server_id` | IMAP `ID` server info (RFC 2971) |
+| `accounts_health` *(global)* | Per-account NOOP + cache/watcher status (read-only, no new connections) |
 
 ### Sieve / server-side rules (3 read tools, +3 under --write)
 
