@@ -21,14 +21,38 @@ The local cache turns your mailbox into a queryable database that AI assistants 
 ## Features
 
 - **Full IMAP access** -- read, search, move, copy, flag, archive, and draft emails
+- **Read-only by default, opt-in `--write` mode** for sending, replying, forwarding, and deleting (see [Read-only vs write mode](#read-only-vs-write-mode))
 - **Persistent SQLite cache** with optional AES encryption (Fernet) -- emails and attachments stored locally for fast offline access
 - **Cross-platform secure credential storage** via OS keyring (macOS Keychain / Windows Credential Locker / Linux SecretService)
 - **Flexible cache loading** -- recent N emails, new-only, older (paginate backwards), or date range
 - **Cache-first reads** -- subsequent queries served from local cache without hitting the IMAP server
 - **IMAP IDLE watching** for real-time notifications across multiple mailboxes
 - **Auto-archive** -- automatically archive emails from configured sender patterns
-- **Draft composition** with configurable signature (text and HTML)
+- **Draft composition** with configurable signature (text and HTML) and file attachments
 - **Bulk email sorting** via MCP tools -- move thousands of emails into folders by sender patterns
+
+## Read-only vs write mode
+
+By default, the server starts in **read-only mode**: it exposes only tools that read or organize email -- including marking, flagging, moving, copying, archiving, and saving drafts. Tools that send mail externally or delete messages are not exposed at all.
+
+Pass `--write` to enable the four write-mode tools:
+
+| Tool | Description |
+|------|-------------|
+| `send_email` | Send a new email via SMTP, with optional attachments and Sent-folder copy |
+| `reply_email` | Reply (or reply-all) to an email by UID, preserving threading headers |
+| `forward_email` | Forward an email by UID, re-attaching original attachments |
+| `delete_email` | Move messages to Trash (default) or `\Deleted` + EXPUNGE (with `permanent=true`) |
+
+```bash
+# Read-only (default) -- safe for AI assistants to organize without sending
+claude mcp add imap-mcp /path/to/imap-mcp -- --config /path/to/config.json
+
+# Read-write -- assistants can send, reply, forward, and delete
+claude mcp add imap-mcp /path/to/imap-mcp -- --config /path/to/config.json --write
+```
+
+When the server is started without `--write`, write-mode tools are not visible to the MCP client at all (they are not advertised in `list_tools`), and any attempt to invoke them by name returns a permission error.
 
 ## Security
 
@@ -387,7 +411,16 @@ Use `get_cache_stats` to see how many emails are cached, database size, and encr
 | `move_email` | Move emails to another folder |
 | `copy_email` | Copy emails to another folder |
 | `archive_email` | Move emails to Archive folder |
-| `save_draft` | Save a draft with optional signature |
+| `save_draft` | Save a draft with optional signature and file attachments |
+
+### Write-mode actions (4 tools, require `--write`)
+
+| Tool | Description |
+|------|-------------|
+| `send_email` | Send via SMTP, optionally save copy to Sent (supports attachments) |
+| `reply_email` | Reply / reply-all by UID, with proper `In-Reply-To`/`References` headers |
+| `forward_email` | Forward by UID, re-attaches original attachments by default |
+| `delete_email` | Move to Trash (default) or permanently delete with `\Deleted` + EXPUNGE |
 
 ### Statistics (2 tools)
 

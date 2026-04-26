@@ -192,6 +192,7 @@ def imap_wrapper(mock_imap_client):
     wrapper.current_mailbox = "INBOX"
     wrapper.config = {
         "imap": {"host": "imap.example.com", "port": 993, "secure": True},
+        "smtp": {"host": "smtp.example.com", "port": 587, "secure": False, "starttls": True},
         "credentials": {"username": "user@example.com", "password": "secret"},
         "folders": {
             "inbox": "INBOX",
@@ -199,6 +200,8 @@ def imap_wrapper(mock_imap_client):
             "waiting": "waiting",
             "someday": "someday",
             "archive": "Archive",
+            "sent": "Sent",
+            "trash": "Trash",
         },
         "auto_archive": {"enabled": False},
         "cache": {"enabled": False, "db_path": "/tmp/test-imap-cache.db", "encrypt": False},

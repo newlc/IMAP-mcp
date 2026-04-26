@@ -21,6 +21,19 @@ imap_client = ImapClientWrapper()
 # Config path (set from CLI --config argument)
 _config_path = "config.json"
 
+# Write-mode flag (set from CLI --write argument). When False, the server runs
+# read-only: tools that send mail or delete messages are not exposed and will
+# refuse to run if invoked anyway.
+_write_enabled = False
+
+# Names of tools that require --write mode.
+WRITE_TOOL_NAMES = frozenset({
+    "send_email",
+    "reply_email",
+    "forward_email",
+    "delete_email",
+})
+
 # Create MCP server
 server = Server("imap-mcp")
 
@@ -45,8 +58,13 @@ def make_tool(
 
 @server.list_tools()
 async def list_tools() -> list[Tool]:
-    """List all available IMAP tools."""
-    return [
+    """List all available IMAP tools.
+
+    Tools that send mail or delete messages (``send_email``, ``reply_email``,
+    ``forward_email``, ``delete_email``) are only exposed when the server was
+    started with ``--write``.
+    """
+    base_tools = [
         # === Connection ===
         make_tool(
             "connect",
@@ -359,6 +377,11 @@ async def list_tools() -> list[Tool]:
                     "description": "BCC addresses",
                 },
                 "htmlBody": {"type": "string", "description": "Email body (HTML, optional)"},
+                "attachments": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Local file paths to attach (optional)",
+                },
                 "draftsFolder": {"type": "string", "description": "Drafts folder name (default: Drafts)"},
                 "includeSignature": {"type": "boolean", "description": "Include signature from config (default: true)"},
             },
@@ -487,6 +510,121 @@ async def list_tools() -> list[Tool]:
         ),
     ]
 
+    # === Write-mode tools (only exposed when --write is set) ===
+    write_tools = [
+        make_tool(
+            "send_email",
+            "Send an email via SMTP. Saves a copy to the Sent folder by default. "
+            "Requires --write mode and SMTP configured in config.json.",
+            {
+                "to": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Recipient addresses",
+                },
+                "subject": {"type": "string", "description": "Email subject"},
+                "body": {"type": "string", "description": "Email body (plain text)"},
+                "cc": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "CC addresses",
+                },
+                "bcc": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "BCC addresses (not visible in headers)",
+                },
+                "htmlBody": {"type": "string", "description": "Email body (HTML, optional)"},
+                "attachments": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Local file paths to attach (optional)",
+                },
+                "includeSignature": {"type": "boolean", "description": "Include signature from config (default: true)"},
+                "saveToSent": {"type": "boolean", "description": "Save copy to Sent folder (default: true)"},
+                "sentFolder": {"type": "string", "description": "Sent folder name (default: from folders.sent or 'Sent')"},
+            },
+            ["to", "subject", "body"],
+        ),
+        make_tool(
+            "reply_email",
+            "Reply to an email by UID. With reply_all=true, includes original To/Cc "
+            "recipients (minus the user's own address) in Cc. Requires --write mode.",
+            {
+                "uid": {"type": "number", "description": "UID of the email to reply to"},
+                "body": {"type": "string", "description": "Reply body (plain text)"},
+                "mailbox": {"type": "string", "description": "Mailbox containing the email (default: current)"},
+                "htmlBody": {"type": "string", "description": "Reply body (HTML, optional)"},
+                "replyAll": {"type": "boolean", "description": "Reply to all original recipients (default: false)"},
+                "attachments": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Local file paths to attach (optional)",
+                },
+                "includeSignature": {"type": "boolean", "description": "Include signature (default: true)"},
+                "quoteOriginal": {"type": "boolean", "description": "Append quoted original message (default: true)"},
+                "saveToSent": {"type": "boolean", "description": "Save copy to Sent folder (default: true)"},
+            },
+            ["uid", "body"],
+        ),
+        make_tool(
+            "forward_email",
+            "Forward an email by UID to new recipients, preserving original "
+            "attachments by default. Requires --write mode.",
+            {
+                "uid": {"type": "number", "description": "UID of the email to forward"},
+                "to": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Recipient addresses",
+                },
+                "body": {"type": "string", "description": "Optional intro text added before the forwarded content"},
+                "mailbox": {"type": "string", "description": "Mailbox containing the email (default: current)"},
+                "cc": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "CC addresses",
+                },
+                "bcc": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "BCC addresses",
+                },
+                "htmlBody": {"type": "string", "description": "Optional HTML intro"},
+                "includeAttachments": {"type": "boolean", "description": "Re-attach original attachments (default: true)"},
+                "extraAttachments": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Additional local files to attach (optional)",
+                },
+                "includeSignature": {"type": "boolean", "description": "Include signature (default: true)"},
+                "saveToSent": {"type": "boolean", "description": "Save copy to Sent folder (default: true)"},
+            },
+            ["uid", "to"],
+        ),
+        make_tool(
+            "delete_email",
+            "Delete emails. Default: move to the Trash folder. With permanent=true: "
+            "set the \\Deleted flag and EXPUNGE without going through Trash. "
+            "Requires --write mode.",
+            {
+                "uids": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "description": "Email UIDs",
+                },
+                "mailbox": {"type": "string", "description": "Source mailbox (default: current)"},
+                "permanent": {"type": "boolean", "description": "Permanent delete (\\Deleted + EXPUNGE) instead of moving to Trash (default: false)"},
+                "trashFolder": {"type": "string", "description": "Trash folder name (default: from folders.trash or 'Trash')"},
+            },
+            ["uids"],
+        ),
+    ]
+
+    if _write_enabled:
+        return base_tools + write_tools
+    return base_tools
+
 
 def serialize_result(result: Any) -> str:
     """Serialize result to JSON string."""
@@ -518,6 +656,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
 async def handle_tool_call(name: str, args: dict) -> Any:
     """Route tool calls to appropriate handler."""
+
+    if name in WRITE_TOOL_NAMES and not _write_enabled:
+        raise PermissionError(
+            f"Tool '{name}' is disabled in read-only mode. "
+            "Restart imap-mcp with --write to enable email sending and deletion."
+        )
 
     # === Connection ===
     if name == "connect":
@@ -679,8 +823,57 @@ async def handle_tool_call(name: str, args: dict) -> Any:
             cc=args.get("cc"),
             bcc=args.get("bcc"),
             html_body=args.get("htmlBody"),
+            attachments=args.get("attachments"),
             drafts_folder=args.get("draftsFolder", "Drafts"),
             include_signature=args.get("includeSignature", True),
+        )
+
+    # === Write-mode actions ===
+    elif name == "send_email":
+        return imap_client.send_email(
+            to=args["to"],
+            subject=args["subject"],
+            body=args["body"],
+            cc=args.get("cc"),
+            bcc=args.get("bcc"),
+            html_body=args.get("htmlBody"),
+            attachments=args.get("attachments"),
+            include_signature=args.get("includeSignature", True),
+            save_to_sent=args.get("saveToSent", True),
+            sent_folder=args.get("sentFolder"),
+        )
+    elif name == "reply_email":
+        return imap_client.reply_email(
+            uid=args["uid"],
+            body=args["body"],
+            mailbox=args.get("mailbox"),
+            html_body=args.get("htmlBody"),
+            reply_all=args.get("replyAll", False),
+            attachments=args.get("attachments"),
+            include_signature=args.get("includeSignature", True),
+            quote_original=args.get("quoteOriginal", True),
+            save_to_sent=args.get("saveToSent", True),
+        )
+    elif name == "forward_email":
+        return imap_client.forward_email(
+            uid=args["uid"],
+            to=args["to"],
+            body=args.get("body", ""),
+            mailbox=args.get("mailbox"),
+            cc=args.get("cc"),
+            bcc=args.get("bcc"),
+            html_body=args.get("htmlBody"),
+            include_attachments=args.get("includeAttachments", True),
+            extra_attachments=args.get("extraAttachments"),
+            include_signature=args.get("includeSignature", True),
+            save_to_sent=args.get("saveToSent", True),
+        )
+    elif name == "delete_email":
+        return imap_client.delete_email(
+            uids=args["uids"],
+            mailbox=args.get("mailbox"),
+            permanent=args.get("permanent", False),
+            trash_folder=args.get("trashFolder"),
         )
 
     # === Statistics ===
@@ -775,6 +968,13 @@ def main():
         default="config.json",
         help="Path to config.json (default: config.json)",
     )
+    parser.add_argument(
+        "--write",
+        action="store_true",
+        help="Enable write-mode tools (send_email, reply_email, forward_email, "
+             "delete_email). Without this flag the server is read-only -- "
+             "only reading and organizing operations are exposed.",
+    )
     args = parser.parse_args()
 
     if args.set_password or args.delete_password:
@@ -815,8 +1015,9 @@ def main():
             print(f"Connection OK. Password stored in keyring for {username}")
         return
 
-    global _config_path
+    global _config_path, _write_enabled
     _config_path = args.config
+    _write_enabled = bool(args.write)
     asyncio.run(run_server())
 
 

@@ -6,7 +6,9 @@
   },
   "smtp": {
     "host": "smtp.example.com",
-    "port": 587
+    "port": 587,
+    "secure": false,
+    "starttls": true
   },
   "credentials": {
     "username": "your-email@example.com",
@@ -28,7 +30,9 @@
     "waiting": "Waiting",
     "someday": "Someday",
     "archive": "Archive",
-    "drafts": "Drafts"
+    "drafts": "Drafts",
+    "sent": "Sent",
+    "trash": "Trash"
   },
   "cache": {
     "enabled": true,
