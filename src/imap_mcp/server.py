@@ -812,6 +812,10 @@ async def list_tools() -> list[Tool]:
                 "mailbox": {"type": "string", "description": "Mailbox (default: current)"},
                 "body_chars": {"type": "number", "description": "Max plain-text snippet length (default: 300)"},
                 "peek_bytes": {"type": "number", "description": "Bytes of message text to fetch per uncached UID via partial FETCH (default: max(body_chars*4, 1024); pass 0 for headers only)"},
+                "format": {
+                    "type": "string", "enum": ["markdown", "plain"],
+                    "description": "Snippet rendering: 'markdown' (default, keeps links/emphasis from html2text) or 'plain' (strips them).",
+                },
             },
             ["uids"],
         ),
@@ -1364,6 +1368,7 @@ def _dispatch_tool_sync(name: str, args: dict, account: Optional[str]) -> Any:
             mailbox=args.get("mailbox"),
             body_chars=args.get("body_chars", 300),
             peek_bytes=args.get("peek_bytes"),
+            format=args.get("format", "markdown"),
         )
     elif name == "bulk_action":
         return cli.bulk_action(

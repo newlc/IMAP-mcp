@@ -69,6 +69,7 @@ from .mail_utils import (
     parse_calendar_invites,
     sanitize_html,
     smart_truncate,
+    strip_markdown,
     with_retries,
 )
 from .watcher import ImapWatcher
@@ -1747,7 +1748,13 @@ class ImapClientWrapper(SendingMixin):
     def move_email(
         self, uids: list[int], destination: str, mailbox: Optional[str] = None
     ) -> bool:
-        """Move emails to another mailbox."""
+        """Move emails to another mailbox.
+
+        IMAP ``MOVE`` (RFC 6851) handles Gmail correctly -- the source
+        label is removed. The Gmail-specific dedup logic lives in
+        :meth:`archive_email`, where the default ``Archive`` folder
+        doesn't exist on Gmail and we fall back to label removal.
+        """
         self._ensure_connected()
         if mailbox:
             self.select_mailbox(mailbox)
@@ -1782,9 +1789,56 @@ class ImapClientWrapper(SendingMixin):
         mailbox: Optional[str] = None,
         archive_folder: str = "Archive",
     ) -> bool:
-        """Archive emails (move to Archive folder)."""
+        """Archive emails (move to Archive folder).
+
+        On Gmail (advertises ``X-GM-EXT-1``) "Archive" is not a folder --
+        archiving is conventionally implemented as removing the
+        ``\\Inbox`` Gmail label, leaving the message visible only in
+        ``[Gmail]/All Mail``. When we detect Gmail and the caller didn't
+        override the archive folder to one that actually exists, we
+        switch to that label-strip path. Configurable via
+        ``account.imap.gmail_label_dedup = false`` to force the regular
+        MOVE behaviour.
+        """
+        if self._is_gmail() and self._should_use_gmail_label_dedup(archive_folder):
+            self._ensure_connected()
+            if mailbox:
+                self.select_mailbox(mailbox)
+            else:
+                self.select_mailbox("INBOX")
+            # Strip the \Inbox Gmail label. The message stays in
+            # [Gmail]/All Mail and disappears from INBOX -- which is what
+            # users mean by "archive on Gmail".
+            self.client.remove_gmail_labels(uids, ["\\Inbox"])
+            return True
         return self.move_email(uids, archive_folder, mailbox)
 
+    def _is_gmail(self) -> bool:
+        """Return True if the IMAP server is Gmail (advertises X-GM-EXT-1).
+
+        Cached on first call.
+        """
+        cached = getattr(self, "_gmail_detected", None)
+        if cached is not None:
+            return cached
+        try:
+            caps = {c.upper() for c in self._get_capabilities_set()}
+        except Exception:
+            caps = set()
+        is_gmail = "X-GM-EXT-1" in caps
+        self._gmail_detected = is_gmail
+        return is_gmail
+
+    def _should_use_gmail_label_dedup(self, archive_folder: str) -> bool:
+        """When True, archive_email strips the \\Inbox label instead of MOVE."""
+        cfg = self.config.get("imap", {})
+        if cfg.get("gmail_label_dedup") is False:
+            return False
+        # If the caller explicitly pointed at a real Gmail folder
+        # (``[Gmail]/All Mail``, ``Archive`` they created themselves, etc.)
+        # they probably know what they want -- only kick in for the bare
+        # "Archive" default that doesn't exist on a stock Gmail account.
+        return archive_folder == "Archive"
 
     # === HTML rendering / inline images / calendar ======================
 
@@ -2121,11 +2175,12 @@ class ImapClientWrapper(SendingMixin):
         mailbox: Optional[str] = None,
         body_chars: int = 300,
         peek_bytes: Optional[int] = None,
+        format: str = "markdown",
     ) -> list[dict]:
         """Return a compact summary list for ``uids`` -- cheap LLM-friendly.
 
         Each entry has subject, sender, date, flags, size, has_attachments
-        and the first ``body_chars`` of the plain-text body. Bodies are
+        and the first ``body_chars`` of the body snippet. Bodies are
         served from cache when available so a 50-email overview costs zero
         IMAP body fetches the second time around.
 
@@ -2134,7 +2189,16 @@ class ImapClientWrapper(SendingMixin):
         RFC 3501) -- defaults to ``max(body_chars * 4, 1024)`` so the
         snippet has enough material even after MIME decoding overhead. Pass
         ``peek_bytes=0`` to skip the body fetch entirely (only headers).
+
+        ``format`` controls snippet rendering:
+
+        * ``"markdown"`` (default) -- preserves links and emphasis from
+          html2text-rendered HTML bodies.
+        * ``"plain"`` -- strips Markdown markers (``[text](url)``,
+          ``**bold**``, etc.) for dense UIs.
         """
+        if format not in ("markdown", "plain"):
+            raise ValueError(f"format must be 'markdown' or 'plain', got {format!r}")
         self._ensure_connected()
         if mailbox:
             self.select_mailbox(mailbox)
@@ -2153,7 +2217,7 @@ class ImapClientWrapper(SendingMixin):
             for u in uids:
                 row = self.email_cache.get_email(effective_mailbox, u)
                 if row and row.get("has_body"):
-                    cached_summaries[u] = self._row_to_summary(row, body_chars)
+                    cached_summaries[u] = self._row_to_summary(row, body_chars, format)
                 else:
                     uids_need_body.append(u)
         else:
@@ -2200,16 +2264,23 @@ class ImapClientWrapper(SendingMixin):
                     "unread": "\\Seen" not in hdr.flags,
                     "size": hdr.size,
                     "has_attachments": has_att,
-                    "snippet": smart_truncate(text, body_chars),
+                    "snippet": smart_truncate(
+                        strip_markdown(text) if format == "plain" else text,
+                        body_chars,
+                    ),
                 }
 
         # Preserve input order.
         return [cached_summaries[u] for u in uids if u in cached_summaries]
 
     @staticmethod
-    def _row_to_summary(row: dict, body_chars: int) -> dict:
+    def _row_to_summary(
+        row: dict, body_chars: int, format: str = "markdown",
+    ) -> dict:
         """Build a summary dict directly from a cached emails row."""
         text = row.get("body_text") or ""
+        if format == "plain":
+            text = strip_markdown(text)
         flags = []
         try:
             flags = json.loads(row.get("flags") or "[]")
@@ -2392,13 +2463,22 @@ class ImapClientWrapper(SendingMixin):
 
     # === Account health =================================================
 
-    def health_check(self) -> dict:
+    # Account is considered unhealthy when quota usage crosses this %.
+    QUOTA_WARNING_PCT = 95.0
+
+    def health_check(self, check_quota: bool = True) -> dict:
         """Light-weight reachability check for this account.
 
         Tries to issue a NOOP if connected, otherwise just reports status.
         Doesn't open a new connection -- intended to be called by the
         ``accounts_health`` server-level tool, which inspects every account
         without forcing a connect.
+
+        With ``check_quota=True`` (default) also queries IMAP QUOTA for
+        INBOX (cheap; one extra round-trip). When usage exceeds
+        :attr:`QUOTA_WARNING_PCT` the result flips to ``ok=false`` with
+        ``reason="quota near full"`` so a long-running agent can surface
+        the warning before sends start failing.
         """
         if not self.client:
             return {
@@ -2423,107 +2503,56 @@ class ImapClientWrapper(SendingMixin):
                 }
             except Exception:
                 cache_stats = None
-        return {
+
+        ok = True
+        reason: Optional[str] = None
+        quota_info: Optional[dict] = None
+        if check_quota:
+            quota_info = self._compute_quota_summary("INBOX")
+            if quota_info and quota_info.get("usage_pct") is not None:
+                if quota_info["usage_pct"] >= self.QUOTA_WARNING_PCT:
+                    ok = False
+                    reason = (
+                        f"quota near full: "
+                        f"{quota_info['usage_pct']:.1f}% used"
+                    )
+
+        result = {
             "connected": True,
-            "ok": True,
+            "ok": ok,
             "current_mailbox": self.current_mailbox,
             "watching": self.watching,
             "cache": cache_stats,
+            "quota": quota_info,
         }
+        if reason:
+            result["reason"] = reason
+        return result
 
-    # === Draft management ================================================
-
-    def update_draft(
-        self,
-        uid: int,
-        to: list[str],
-        subject: str,
-        body: str,
-        cc: Optional[list[str]] = None,
-        bcc: Optional[list[str]] = None,
-        html_body: Optional[str] = None,
-        attachments: Optional[list[str]] = None,
-        drafts_folder: str = "Drafts",
-        include_signature: bool = True,
-    ) -> dict:
-        """Replace an existing draft.
-
-        IMAP drafts are immutable, so this APPENDs the new draft and then
-        \\Deleted+EXPUNGEs the original UID. Returns the new UID when the
-        server reports it via APPENDUID, otherwise just confirms the swap.
+    def _compute_quota_summary(self, mailbox: str) -> Optional[dict]:
+        """Pull the STORAGE resource out of IMAP QUOTA and turn it into
+        ``{"usage_kb", "limit_kb", "usage_pct"}`` (or ``None`` when the
+        server doesn't expose QUOTA).
         """
-        self._ensure_connected()
-
-        msg = self._build_message(
-            to=to, subject=subject, body=body,
-            cc=cc, bcc=bcc, html_body=html_body,
-            attachments=attachments,
-            include_signature=include_signature,
-            include_bcc_header=True,
-        )
-
-        new_uid: Optional[int] = None
         try:
-            append_resp = self.client.append(
-                drafts_folder, msg.as_bytes(), flags=[b"\\Draft"]
-            )
-            actual_folder = drafts_folder
-        except Exception as e:
-            err = str(e).lower()
-            if (
-                ("namespace" in err or "no such" in err or "mailbox" in err)
-                and not drafts_folder.startswith("INBOX.")
-                and drafts_folder != "INBOX"
-            ):
-                actual_folder = f"INBOX.{drafts_folder}"
-                append_resp = self.client.append(
-                    actual_folder, msg.as_bytes(), flags=[b"\\Draft"]
-                )
-            else:
-                raise
-
-        # IMAPClient may return the assigned UID via APPENDUID.
-        if isinstance(append_resp, (bytes, str)):
-            try:
-                # Format: "[APPENDUID <uidvalidity> <uid>] (Success)"
-                text = append_resp.decode() if isinstance(append_resp, bytes) else append_resp
-                if "APPENDUID" in text.upper():
-                    parts = text.split()
-                    for i, p in enumerate(parts):
-                        if p.upper().endswith("APPENDUID") and i + 2 < len(parts):
-                            new_uid = int(parts[i + 2].rstrip("]"))
-                            break
-            except (ValueError, AttributeError):
-                pass
-
-        # Delete the old draft.
-        self.select_mailbox(actual_folder)
-        self.client.add_flags([uid], [b"\\Deleted"])
-        self.client.expunge()
-
-        return {
-            "updated": True,
-            "old_uid": uid,
-            "new_uid": new_uid,
-            "drafts_folder": actual_folder,
-        }
-
-    def delete_draft(
-        self, uid: int, drafts_folder: str = "Drafts"
-    ) -> dict:
-        """Permanently remove one draft from the Drafts folder."""
-        self._ensure_connected()
-        try:
-            self.select_mailbox(drafts_folder)
-        except Exception as e:
-            err = str(e).lower()
-            if "namespace" in err or "no such" in err or "mailbox" in err:
-                self.select_mailbox(f"INBOX.{drafts_folder}")
-            else:
-                raise
-        self.client.add_flags([uid], [b"\\Deleted"])
-        self.client.expunge()
-        return {"deleted": True, "uid": uid, "drafts_folder": self.current_mailbox}
+            raw = self.get_quota(mailbox)
+        except Exception:
+            return None
+        if not raw or "error" in raw:
+            return None
+        for r in raw.get("resources", []):
+            if (r.get("resource") or "").upper() == "STORAGE":
+                usage = r.get("usage")
+                limit = r.get("limit")
+                pct: Optional[float] = None
+                if isinstance(usage, (int, float)) and isinstance(limit, (int, float)) and limit:
+                    pct = round(usage * 100.0 / limit, 2)
+                return {
+                    "usage_kb": usage,
+                    "limit_kb": limit,
+                    "usage_pct": pct,
+                }
+        return None
 
     # === Spam ============================================================
 

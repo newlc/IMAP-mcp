@@ -325,6 +325,99 @@ class SendingMixin:
 
         return {"saved": True, "drafts_folder": actual, "idempotent_replay": False}
 
+    def update_draft(
+        self,
+        uid: int,
+        to: list[str],
+        subject: str,
+        body: str,
+        cc: Optional[list[str]] = None,
+        bcc: Optional[list[str]] = None,
+        html_body: Optional[str] = None,
+        attachments: Optional[list[str]] = None,
+        drafts_folder: str = "Drafts",
+        include_signature: bool = True,
+    ) -> dict:
+        """Replace an existing draft.
+
+        IMAP drafts are immutable, so this APPENDs the new draft and then
+        \\Deleted+EXPUNGEs the original UID. Returns the new UID when the
+        server reports it via APPENDUID, otherwise just confirms the swap.
+        """
+        self._ensure_connected()
+
+        msg = self._build_message(
+            to=to, subject=subject, body=body,
+            cc=cc, bcc=bcc, html_body=html_body,
+            attachments=attachments,
+            include_signature=include_signature,
+            include_bcc_header=True,
+        )
+
+        new_uid: Optional[int] = None
+        try:
+            append_resp = self.client.append(
+                drafts_folder, msg.as_bytes(), flags=[b"\\Draft"]
+            )
+            actual_folder = drafts_folder
+        except Exception as e:
+            err = str(e).lower()
+            if (
+                ("namespace" in err or "no such" in err or "mailbox" in err)
+                and not drafts_folder.startswith("INBOX.")
+                and drafts_folder != "INBOX"
+            ):
+                actual_folder = f"INBOX.{drafts_folder}"
+                append_resp = self.client.append(
+                    actual_folder, msg.as_bytes(), flags=[b"\\Draft"]
+                )
+            else:
+                raise
+
+        # IMAPClient may return the assigned UID via APPENDUID.
+        if isinstance(append_resp, (bytes, str)):
+            try:
+                # Format: "[APPENDUID <uidvalidity> <uid>] (Success)"
+                text = append_resp.decode() if isinstance(append_resp, bytes) else append_resp
+                if "APPENDUID" in text.upper():
+                    parts = text.split()
+                    for i, p in enumerate(parts):
+                        if p.upper().endswith("APPENDUID") and i + 2 < len(parts):
+                            new_uid = int(parts[i + 2].rstrip("]"))
+                            break
+            except (ValueError, AttributeError):
+                pass
+
+        # Delete the old draft.
+        self.select_mailbox(actual_folder)
+        self.client.add_flags([uid], [b"\\Deleted"])
+        self.client.expunge()
+
+        return {
+            "updated": True,
+            "old_uid": uid,
+            "new_uid": new_uid,
+            "drafts_folder": actual_folder,
+        }
+
+    def delete_draft(
+        self, uid: int, drafts_folder: str = "Drafts"
+    ) -> dict:
+        """Permanently remove one draft from the Drafts folder."""
+        self._ensure_connected()
+        try:
+            self.select_mailbox(drafts_folder)
+        except Exception as e:
+            err = str(e).lower()
+            if "namespace" in err or "no such" in err or "mailbox" in err:
+                self.select_mailbox(f"INBOX.{drafts_folder}")
+            else:
+                raise
+        self.client.add_flags([uid], [b"\\Deleted"])
+        self.client.expunge()
+        return {"deleted": True, "uid": uid, "drafts_folder": self.current_mailbox}
+
+
     # === Sending (write-mode) ===
 
     def _resolve_smtp_password(self) -> tuple[str, str]:
@@ -615,27 +708,43 @@ class SendingMixin:
         """Forward the email with the given UID to new recipients.
 
         With ``include_attachments=True`` (default), original attachments
-        are re-attached to the forwarded message.
+        are re-attached to the forwarded message. When the persistent
+        cache holds the original (body + attachments), the IMAP fetch is
+        skipped entirely.
         """
         self._ensure_connected()
         if mailbox:
             self.select_mailbox(mailbox)
+        effective_mailbox = mailbox or self.current_mailbox or "INBOX"
 
-        data = self.client.fetch([uid], ["BODY[]"])
-        if uid not in data:
-            raise ValueError(f"Email with UID {uid} not found")
-        orig = email.message_from_bytes(data[uid].get(b"BODY[]", b""))
+        # --- 1) Try to source everything from the persistent cache. ----
+        forward_data = self._forward_data_from_cache(
+            effective_mailbox, uid, include_attachments=include_attachments,
+        )
+        if forward_data is not None:
+            cache_hit = True
+        else:
+            # --- 2) Fall back to fetching the raw RFC822 from IMAP. -----
+            data = self.client.fetch([uid], ["BODY[]"])
+            if uid not in data:
+                raise ValueError(f"Email with UID {uid} not found")
+            orig = email.message_from_bytes(data[uid].get(b"BODY[]", b""))
+            forward_data = self._forward_data_from_message(
+                orig, include_attachments=include_attachments,
+            )
+            cache_hit = False
 
-        orig_subject = self._decode_header(orig.get("Subject", ""))
+        orig_subject = forward_data["subject"]
         bare_subject = self._strip_subject_prefix(
             orig_subject, "Fwd:", "FWD:", "Fw:", "FW:", "fwd:", "fw:"
         )
         subject = f"Fwd: {bare_subject}" if bare_subject else "Fwd:"
 
-        from_str = self._decode_header(orig.get("From", ""))
-        to_str = self._decode_header(orig.get("To", ""))
-        date_str = orig.get("Date", "")
-        orig_body = self._extract_body(orig)
+        from_str = forward_data["from_str"]
+        to_str = forward_data["to_str"]
+        date_str = forward_data["date_str"]
+        body_text = forward_data["body_text"]
+        body_html = forward_data["body_html"]
 
         fwd_text_header = (
             "\n\n---------- Forwarded message ----------\n"
@@ -644,10 +753,10 @@ class SendingMixin:
             f"Subject: {orig_subject}\n"
             f"To: {to_str}\n\n"
         )
-        final_body = (body or "") + fwd_text_header + (orig_body.text or "")
+        final_body = (body or "") + fwd_text_header + (body_text or "")
 
         final_html: Optional[str] = None
-        if html_body or orig_body.html:
+        if html_body or body_html:
             html_intro = html_body or ""
             html_intro += (
                 "<br><br>"
@@ -657,24 +766,10 @@ class SendingMixin:
                 f"Subject: {orig_subject}<br>"
                 f"To: {to_str}</div><br>"
             )
-            inner_html = orig_body.html or (orig_body.text or "").replace("\n", "<br>")
+            inner_html = body_html or (body_text or "").replace("\n", "<br>")
             final_html = html_intro + inner_html
 
-        # Stream attachments directly from the original message into the
-        # outgoing one -- no temp files, no double-encode round trip.
-        inline_atts: list[tuple[str, str, bytes]] = []
-        if include_attachments:
-            for att in self._extract_attachment_info(orig):
-                data_bytes = self._get_attachment_bytes(orig, att.index)
-                if not data_bytes:
-                    continue
-                inline_atts.append((
-                    att.filename or f"attachment_{att.index}",
-                    att.content_type or "application/octet-stream",
-                    data_bytes,
-                ))
-
-        return self.send_email(
+        result = self.send_email(
             to=to,
             subject=subject,
             body=final_body,
@@ -682,11 +777,111 @@ class SendingMixin:
             bcc=bcc,
             html_body=final_html,
             attachments=extra_attachments or None,
-            inline_attachments=inline_atts or None,
+            inline_attachments=forward_data["attachments"] or None,
             include_signature=include_signature,
             save_to_sent=save_to_sent,
             idempotency_key=idempotency_key,
         )
+        result["forward_source"] = "cache" if cache_hit else "imap"
+        return result
+
+    def _forward_data_from_cache(
+        self,
+        mailbox: str,
+        uid: int,
+        *,
+        include_attachments: bool,
+    ) -> Optional[dict]:
+        """Build the forward-data dict from the persistent cache.
+
+        Returns ``None`` when the cache doesn't have the body (so the
+        caller falls back to IMAP). When ``include_attachments=True``,
+        every cached attachment is materialized as ``(filename, ctype,
+        bytes)``.
+        """
+        if not self.email_cache:
+            return None
+        row = self.email_cache.get_email(mailbox, uid)
+        if not row or not row.get("has_body"):
+            return None
+
+        # Re-format the To header from the cached JSON (matches what we'd
+        # parse from a real IMAP message header).
+        import json as _json
+        try:
+            to_addrs = _json.loads(row.get("to_json") or "[]")
+        except (TypeError, ValueError):
+            to_addrs = []
+        to_str = ", ".join(
+            f"{a.get('name')} <{a['email']}>" if a.get("name") else a["email"]
+            for a in to_addrs if a.get("email")
+        )
+        from_email = row.get("from_email") or ""
+        from_name = row.get("from_name") or ""
+        from_str = f"{from_name} <{from_email}>" if from_name else from_email
+
+        attachments_list: list[tuple[str, str, bytes]] = []
+        if include_attachments:
+            atts = self.email_cache.get_attachments(mailbox, uid)
+            for att in atts:
+                got = self.email_cache.get_attachment_data(
+                    mailbox, uid, att["idx"]
+                )
+                if got is None:
+                    # Metadata without bytes -- can't safely forward.
+                    # Bail out to the IMAP path so we don't silently
+                    # drop attachments.
+                    return None
+                filename, ctype, raw = got
+                if raw is None:
+                    # Row exists but the BLOB is NULL (cache populated
+                    # with metadata only). Same recovery: re-fetch from
+                    # IMAP rather than forward without the attachment.
+                    return None
+                attachments_list.append(
+                    (filename or f"attachment_{att['idx']}",
+                     ctype or "application/octet-stream",
+                     raw)
+                )
+
+        return {
+            "subject": row.get("subject") or "",
+            "from_str": from_str,
+            "to_str": to_str,
+            "date_str": row.get("date") or "",
+            "body_text": row.get("body_text") or "",
+            "body_html": row.get("body_html") or "",
+            "attachments": attachments_list,
+        }
+
+    def _forward_data_from_message(
+        self,
+        orig: email.message.Message,
+        *,
+        include_attachments: bool,
+    ) -> dict:
+        """Build the forward-data dict from a parsed IMAP message."""
+        attachments_list: list[tuple[str, str, bytes]] = []
+        if include_attachments:
+            for att in self._extract_attachment_info(orig):
+                data_bytes = self._get_attachment_bytes(orig, att.index)
+                if not data_bytes:
+                    continue
+                attachments_list.append((
+                    att.filename or f"attachment_{att.index}",
+                    att.content_type or "application/octet-stream",
+                    data_bytes,
+                ))
+        body = self._extract_body(orig)
+        return {
+            "subject": self._decode_header(orig.get("Subject", "")),
+            "from_str": self._decode_header(orig.get("From", "")),
+            "to_str": self._decode_header(orig.get("To", "")),
+            "date_str": orig.get("Date", "") or "",
+            "body_text": body.text or "",
+            "body_html": body.html or "",
+            "attachments": attachments_list,
+        }
 
     def delete_email(
         self,

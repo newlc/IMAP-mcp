@@ -185,8 +185,45 @@ def parse_authentication_results(headers) -> dict:
     return out
 
 
-def html_to_plain(html: str) -> str:
-    """Convert an HTML body to readable plain text.
+def strip_markdown(text: str) -> str:
+    """Best-effort stripping of html2text-style markdown markers.
+
+    Removes ``[text](url)`` link syntax (keeps the text), ``**bold**`` /
+    ``__bold__`` and ``*italic*`` / ``_italic_`` emphasis, and image
+    placeholders. Used by summary tools when the caller passes
+    ``format="plain"`` after the body was already rendered as markdown
+    by html2text (the cache path).
+    """
+    if not text:
+        return text
+    import re as _re_md
+    # [link text](url) -> link text
+    text = _re_md.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    # ![alt](url) -> alt
+    text = _re_md.sub(r"!\[([^\]]*)\]\([^)]+\)", r"\1", text)
+    # **bold** / __bold__
+    text = _re_md.sub(r"\*\*([^*]+)\*\*", r"\1", text)
+    text = _re_md.sub(r"__([^_]+)__", r"\1", text)
+    # *italic* / _italic_  (avoid matching inside words)
+    text = _re_md.sub(r"(?<!\w)\*([^*\n]+)\*(?!\w)", r"\1", text)
+    text = _re_md.sub(r"(?<!\w)_([^_\n]+)_(?!\w)", r"\1", text)
+    # Heading markers (#, ##) at start of line
+    text = _re_md.sub(r"^#{1,6}\s+", "", text, flags=_re_md.MULTILINE)
+    # Backticks (inline code)
+    text = _re_md.sub(r"`([^`]+)`", r"\1", text)
+    return text
+
+
+def html_to_plain(html: str, format: str = "markdown") -> str:
+    """Convert an HTML body to readable text.
+
+    With ``format="markdown"`` (default) preserves links as ``[text](url)``
+    and emphasis as ``*..*`` -- the html2text default. Useful when the
+    output is shown to an LLM that benefits from structure cues.
+
+    With ``format="plain"`` strips all link/emphasis markers, leaving
+    bare token text. Useful for snippets shown in dense UIs or fed into
+    keyword search.
 
     Used as a fallback when an email is HTML-only (no ``text/plain`` part)
     so the FTS index, snippet generator and ``get_email_summary`` still
@@ -195,11 +232,18 @@ def html_to_plain(html: str) -> str:
     if not html:
         return ""
     h = html2text.HTML2Text()
-    h.ignore_links = False
-    h.ignore_images = True   # data URIs would bloat the snippet
-    h.ignore_emphasis = False
-    h.body_width = 0          # don't wrap; let the consumer decide
+    h.ignore_images = True       # data URIs would bloat the snippet
+    h.body_width = 0              # don't wrap; let the consumer decide
     h.unicode_snob = True
+    if format == "plain":
+        h.ignore_links = True
+        h.ignore_emphasis = True
+        h.ignore_tables = True
+    elif format == "markdown":
+        h.ignore_links = False
+        h.ignore_emphasis = False
+    else:
+        raise ValueError(f"Unknown format: {format!r}; expected 'markdown' or 'plain'")
     try:
         return h.handle(html).strip()
     except Exception as exc:
