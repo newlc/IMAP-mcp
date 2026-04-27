@@ -1,0 +1,35 @@
+name: Integration tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Run nightly to catch external breakage (Greenmail image updates etc.).
+  schedule:
+    - cron: "0 5 * * *"
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test,integration,attachments]"
+
+      - name: Pull Greenmail image
+        run: docker pull greenmail/standalone:2.0.1
+
+      - name: Run integration tests
+        run: |
+          # Override the default "-m 'not integration'" addopts to include them.
+          pytest tests/integration/ -m integration -v --tb=short

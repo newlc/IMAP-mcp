@@ -86,6 +86,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS emails_fts USING fts5(
     body,
     from_address,
     to_address,
+    attachments,
     tokenize = 'unicode61 remove_diacritics 2'
 );
 
@@ -150,6 +151,42 @@ class EmailCache:
             self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(_SCHEMA)
         self.conn.commit()
+        self._migrate_fts_schema()
+
+    # ------------------------------------------------------------------
+    # Schema migration helpers
+    # ------------------------------------------------------------------
+
+    def _migrate_fts_schema(self) -> None:
+        """Drop and recreate ``emails_fts`` if its column count is stale.
+
+        FTS5 virtual tables don't support ``ALTER`` for new columns, and
+        ``CREATE VIRTUAL TABLE IF NOT EXISTS`` won't change an existing
+        table's column list. So when we extend the FTS schema (e.g. when
+        we added the ``attachments`` column for PDF/DOCX text indexing),
+        we need to detect the mismatch and rebuild the virtual table.
+        Existing emails are kept; the FTS index is re-populated lazily on
+        the next ``rebuild_fts()`` or `index_email_fts()` call.
+        """
+        try:
+            cur = self.conn.execute("SELECT * FROM emails_fts LIMIT 0")
+            column_count = len(cur.description)
+        except sqlite3.OperationalError:
+            return  # table missing -- _SCHEMA's CREATE will handle it
+        # Bump this when adding columns to emails_fts.
+        EXPECTED_COLUMNS = 7
+        if column_count != EXPECTED_COLUMNS:
+            logger.info(
+                "FTS5 schema mismatch (%d columns; expected %d); rebuilding.",
+                column_count, EXPECTED_COLUMNS,
+            )
+            self.conn.execute("DROP TABLE emails_fts")
+            self.conn.executescript(_SCHEMA)
+            self.conn.commit()
+            try:
+                self.rebuild_fts()
+            except Exception as exc:
+                logger.warning("FTS rebuild after migration failed: %s", exc)
 
     # ------------------------------------------------------------------
     # Encryption helpers
@@ -364,10 +401,13 @@ class EmailCache:
         from_email: Optional[str],
         from_name: Optional[str],
         to_addresses: Optional[list],
+        attachment_text: Optional[str] = None,
     ) -> None:
         """Insert or replace the FTS row for an email.
 
         Called automatically by ``store_email`` when a body is present.
+        ``attachment_text`` (when supplied) feeds the new ``attachments``
+        FTS column so a search for words inside a PDF/DOCX matches.
         """
         to_str = " ".join(
             (a.get("email", "") + " " + (a.get("name") or ""))
@@ -376,15 +416,61 @@ class EmailCache:
             for a in (to_addresses or [])
         )
         from_str = (from_email or "") + " " + (from_name or "")
+        # Preserve any previously-indexed attachment_text on a re-index of
+        # the body alone (store_email upserts the body part separately from
+        # store_attachment).
+        attach_str = attachment_text
+        if attach_str is None:
+            row = self.conn.execute(
+                "SELECT attachments FROM emails_fts WHERE mailbox = ? AND uid = ?",
+                (mailbox, uid),
+            ).fetchone()
+            attach_str = (row["attachments"] if row else "") or ""
+
         # Ensure idempotent insert (FTS5 doesn't support ON CONFLICT).
         self.conn.execute(
             "DELETE FROM emails_fts WHERE mailbox = ? AND uid = ?", (mailbox, uid)
         )
         self.conn.execute(
-            "INSERT INTO emails_fts (mailbox, uid, subject, body, from_address, to_address) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (mailbox, uid, subject or "", body_text or "", from_str, to_str),
+            "INSERT INTO emails_fts "
+            "(mailbox, uid, subject, body, from_address, to_address, attachments) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (mailbox, uid, subject or "", body_text or "", from_str, to_str, attach_str),
         )
+
+    def append_attachment_to_fts(
+        self, mailbox: str, uid: int, attachment_text: str,
+    ) -> None:
+        """Append extracted attachment text to the email's FTS row.
+
+        Idempotent across multiple attachments per email -- the attachment
+        column accumulates whitespace-separated text from each one.
+        """
+        if not attachment_text:
+            return
+        row = self.conn.execute(
+            "SELECT attachments FROM emails_fts WHERE mailbox = ? AND uid = ?",
+            (mailbox, uid),
+        ).fetchone()
+        if row is None:
+            # Email isn't in FTS yet (header-only). Create a stub row so
+            # the attachment text is searchable; body will be filled in
+            # later on the next store_email-with-body call.
+            self.conn.execute(
+                "INSERT INTO emails_fts "
+                "(mailbox, uid, subject, body, from_address, to_address, attachments) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (mailbox, uid, "", "", "", "", attachment_text),
+            )
+        else:
+            existing = row["attachments"] or ""
+            combined = (existing + " " + attachment_text).strip()
+            self.conn.execute(
+                "UPDATE emails_fts SET attachments = ? WHERE mailbox = ? AND uid = ?",
+                (combined, mailbox, uid),
+            )
+        self.conn.commit()
+        self._auto_flush()
 
     def fts_search(
         self,
@@ -401,7 +487,9 @@ class EmailCache:
         their weights are ignored.
         """
         # bm25 weights: (mailbox, uid, subject=5.0, body=1.0, from=2.0, to=1.0)
-        rank_expr = "bm25(emails_fts, 1.0, 1.0, 5.0, 1.0, 2.0, 1.0)"
+        # weights: mailbox, uid (both UNINDEXED -> ignored),
+        # subject=5.0, body=1.0, from=2.0, to=1.0, attachments=1.2.
+        rank_expr = "bm25(emails_fts, 1.0, 1.0, 5.0, 1.0, 2.0, 1.0, 1.2)"
         if mailbox:
             sql = (
                 f"SELECT e.*, {rank_expr} AS rank "
@@ -433,7 +521,16 @@ class EmailCache:
         return row["c"]
 
     def rebuild_fts(self, mailbox: Optional[str] = None) -> int:
-        """Rebuild the FTS index from cached emails. Returns rows indexed."""
+        """Rebuild the FTS index from cached emails + attachments.
+
+        Re-extracts text from every cached attachment whose content type
+        is supported (PDF, DOCX, plain text) so newly-added extractors
+        pick up old data without a full re-sync.
+
+        Returns number of email rows indexed.
+        """
+        from .attachments import extract_text
+
         if mailbox:
             self.conn.execute("DELETE FROM emails_fts WHERE mailbox = ?", (mailbox,))
             rows = self.conn.execute(
@@ -452,9 +549,23 @@ class EmailCache:
                 to_addrs = json.loads(r["to_json"]) if r["to_json"] else []
             except (TypeError, ValueError):
                 to_addrs = []
+            # Pull cached attachment bytes and run the extractors.
+            atts = self.conn.execute(
+                "SELECT filename, content_type, data FROM attachments "
+                "WHERE mailbox = ? AND uid = ?",
+                (r["mailbox"], r["uid"]),
+            ).fetchall()
+            attach_text_chunks: list[str] = []
+            for att in atts:
+                text = extract_text(att["data"], att["content_type"], att["filename"])
+                if text:
+                    attach_text_chunks.append(text)
+            attach_str = " ".join(attach_text_chunks) if attach_text_chunks else None
+
             self.index_email_fts(
                 r["mailbox"], r["uid"], r["subject"], r["body_text"],
                 r["from_email"], r["from_name"], to_addrs,
+                attachment_text=attach_str,
             )
             count += 1
         self.conn.commit()
@@ -596,7 +707,13 @@ class EmailCache:
         size: Optional[int],
         data: bytes,
     ) -> None:
-        """Upsert an attachment (including raw data) into the cache."""
+        """Upsert an attachment (including raw data) into the cache.
+
+        When the optional attachment-text extractors are installed and the
+        content type is supported (PDF, DOCX, ``text/*``), the extracted
+        text is appended to the email's FTS row so a search inside the
+        attachment matches.
+        """
         self.conn.execute(
             """INSERT INTO attachments (mailbox, uid, idx, filename, content_type, size, data)
                VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -608,6 +725,14 @@ class EmailCache:
             """,
             (mailbox, uid, idx, filename, content_type, size, data),
         )
+        # Extract text and append to FTS. extract_text returns "" when the
+        # extractor is unavailable or the format is unsupported -- in that
+        # case we just skip the FTS update (no-op).
+        from .attachments import extract_text
+        text = extract_text(data, content_type, filename)
+        if text:
+            self.append_attachment_to_fts(mailbox, uid, text)
+
         self.conn.commit()
         self._auto_flush()
 

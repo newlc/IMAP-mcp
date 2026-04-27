@@ -37,6 +37,13 @@ test = [
     "pytest-asyncio>=0.23.0",
     "coverage>=7.0.0",
 ]
+integration = [
+    "testcontainers>=4.0.0",
+]
+attachments = [
+    "pypdf>=4.0.0",
+    "python-docx>=1.0.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/newlc/IMAP-mcp"
@@ -57,6 +64,11 @@ packages = ["src/imap_mcp"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 pythonpath = ["src"]
+markers = [
+    "integration: tests that need Docker (Greenmail container)",
+]
+# Skip integration tests by default; they need Docker.
+addopts = "-m 'not integration'"
 
 [tool.coverage.run]
 source = ["src/imap_mcp"]
