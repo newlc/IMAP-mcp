@@ -38,9 +38,10 @@ _KEYRING_USERNAME_DEFAULT = "encryption-key"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS mailbox_meta (
-    mailbox     TEXT PRIMARY KEY,
-    uidvalidity INTEGER NOT NULL,
-    last_sync   TEXT
+    mailbox        TEXT PRIMARY KEY,
+    uidvalidity    INTEGER NOT NULL,
+    last_sync      TEXT,
+    highestmodseq  INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS emails (
@@ -143,7 +144,13 @@ class EmailCache:
         else:
             self.db_path = expanded
             self._fernet = None
-            self.conn = sqlite3.connect(expanded)
+            # check_same_thread=False: the MCP server dispatches each tool
+            # call into a worker thread (asyncio.to_thread) so blocking
+            # IMAP IO doesn't freeze the event loop, but the same EmailCache
+            # connection can be reached from both. Tool calls are still
+            # serial per account (MCP stdio is request/response), so no
+            # concurrent SQLite access actually happens.
+            self.conn = sqlite3.connect(expanded, check_same_thread=False)
 
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys=ON")
@@ -151,11 +158,32 @@ class EmailCache:
             self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(_SCHEMA)
         self.conn.commit()
+        self._migrate_mailbox_meta_columns()
         self._migrate_fts_schema()
 
     # ------------------------------------------------------------------
     # Schema migration helpers
     # ------------------------------------------------------------------
+
+    def _migrate_mailbox_meta_columns(self) -> None:
+        """Add columns to ``mailbox_meta`` for older caches.
+
+        SQLite ``ALTER TABLE`` only supports ADD COLUMN, so this is purely
+        forward-only. New columns: ``highestmodseq`` (CONDSTORE / RFC 7162).
+        """
+        try:
+            cur = self.conn.execute("PRAGMA table_info(mailbox_meta)")
+            cols = {row[1] for row in cur.fetchall()}
+        except sqlite3.OperationalError:
+            return
+        if "highestmodseq" not in cols:
+            try:
+                self.conn.execute(
+                    "ALTER TABLE mailbox_meta ADD COLUMN highestmodseq INTEGER"
+                )
+                self.conn.commit()
+            except sqlite3.OperationalError as exc:
+                logger.warning("Could not add highestmodseq column: %s", exc)
 
     def _migrate_fts_schema(self) -> None:
         """Drop and recreate ``emails_fts`` if its column count is stale.
@@ -212,7 +240,8 @@ class EmailCache:
         If the file is corrupted or the key is wrong, logs a warning
         and starts with a fresh empty database.
         """
-        mem_conn = sqlite3.connect(":memory:")
+        # See note in __init__ about check_same_thread=False.
+        mem_conn = sqlite3.connect(":memory:", check_same_thread=False)
 
         if os.path.exists(self.db_path):
             try:
@@ -236,7 +265,7 @@ class EmailCache:
                     self.db_path, exc,
                 )
                 mem_conn.close()
-                mem_conn = sqlite3.connect(":memory:")
+                mem_conn = sqlite3.connect(":memory:", check_same_thread=False)
 
         return mem_conn
 
@@ -317,6 +346,35 @@ class EmailCache:
             "ON CONFLICT(mailbox) DO UPDATE SET uidvalidity = ?, last_sync = ?",
             (mailbox, uidvalidity, now, uidvalidity, now),
         )
+        self.conn.commit()
+        self._auto_flush()
+
+    def get_highest_modseq(self, mailbox: str) -> Optional[int]:
+        """Return the last-known HIGHESTMODSEQ for ``mailbox`` or ``None``.
+
+        Used by the CONDSTORE-aware sync path: a non-None return means we
+        already have a watermark and can ask the server for messages
+        whose MODSEQ exceeds it (a much smaller fetch than full ``UID
+        FETCH 1:*``).
+        """
+        row = self.conn.execute(
+            "SELECT highestmodseq FROM mailbox_meta WHERE mailbox = ?",
+            (mailbox,),
+        ).fetchone()
+        if row is None:
+            return None
+        v = row["highestmodseq"]
+        return int(v) if v is not None else None
+
+    def update_highest_modseq(self, mailbox: str, modseq: int) -> None:
+        """Record the latest HIGHESTMODSEQ observed for ``mailbox``."""
+        self.conn.execute(
+            "UPDATE mailbox_meta SET highestmodseq = ? WHERE mailbox = ?",
+            (int(modseq), mailbox),
+        )
+        # Edge case: if mailbox_meta has no row yet, the UPDATE is a no-op.
+        # check_uidvalidity always inserts before the first sync, so this
+        # is the common case.
         self.conn.commit()
         self._auto_flush()
 

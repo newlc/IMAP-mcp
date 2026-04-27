@@ -1157,7 +1157,13 @@ async def handle_tool_call(name: str, args: dict) -> Any:
     )
 
     try:
-        result = await _dispatch_tool(name, args, account)
+        # Run the dispatch in a worker thread so blocking IMAP / SMTP IO
+        # doesn't freeze the asyncio event loop. The MCP stdio session can
+        # then keep delivering heartbeats and (in the future) cancellation
+        # while a long sync_emails or load_cache is in flight.
+        result = await asyncio.to_thread(
+            _dispatch_tool_sync, name, args, account,
+        )
         _record_audit(account, name, is_write, args, "ok", None)
         return result
     except Exception as exc:
@@ -1202,8 +1208,15 @@ def _record_audit(
         pass
 
 
-async def _dispatch_tool(name: str, args: dict, account: Optional[str]) -> Any:
-    """Real tool dispatch -- the original handle_tool_call body."""
+def _dispatch_tool_sync(name: str, args: dict, account: Optional[str]) -> Any:
+    """Real tool dispatch -- the original handle_tool_call body, synchronous.
+
+    Runs in a worker thread (see ``handle_tool_call``) so blocking IMAP /
+    SMTP IO doesn't pin the asyncio event loop. Every method called from
+    here is sync; if any future method needs to await something, that
+    method should be invoked from ``handle_tool_call`` directly instead
+    of going through this dispatcher.
+    """
 
     # ------------------------------------------------------------------
     # Global tools that don't target a specific account

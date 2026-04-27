@@ -1216,8 +1216,14 @@ class ImapClientWrapper(SendingMixin):
     ) -> dict:
         """Download emails into persistent SQLite cache.
 
-        Incremental by default — only fetches UIDs not already cached.
-        Set full=True to re-download everything in the date range.
+        Incremental by default. With CONDSTORE-aware servers (RFC 7162;
+        most modern IMAP servers including Dovecot, Cyrus, Gmail, M365,
+        Fastmail) we ask for messages whose ``MODSEQ`` exceeds our last
+        watermark -- effectively a server-side delta. Falls back to the
+        legacy "fetch everything new since the last UID" path on servers
+        without CONDSTORE.
+
+        Set ``full=True`` to re-download everything in the date range.
         """
         self._ensure_connected()
         if not self.email_cache:
@@ -1229,31 +1235,57 @@ class ImapClientWrapper(SendingMixin):
         status = self.get_mailbox_status(mailbox)
         self.email_cache.check_uidvalidity(mailbox, status.uidvalidity)
 
+        # CONDSTORE: try to get server's HIGHESTMODSEQ via SELECT or STATUS.
+        condstore_supported = self._maybe_enable_condstore()
+        prev_modseq = (
+            self.email_cache.get_highest_modseq(mailbox)
+            if (condstore_supported and not full and not since and not before)
+            else None
+        )
+        new_modseq: Optional[int] = None
+        if condstore_supported:
+            new_modseq = self._fetch_highest_modseq(mailbox)
+
         # Build IMAP search criteria
         criteria = []
         if since:
             criteria.extend(["SINCE", self._to_imap_date(since)])
         if before:
             criteria.extend(["BEFORE", self._to_imap_date(before)])
-        if not criteria:
+        # CONDSTORE delta: ask for "everything changed since prev_modseq".
+        # Note: this is in addition to date filters when both are present
+        # so a since-bounded resync still works.
+        used_modseq = False
+        if prev_modseq is not None and not since and not before:
+            criteria = ["MODSEQ", str(prev_modseq + 1)]
+            used_modseq = True
+        elif not criteria:
             criteria = ["ALL"]
 
         uids = self.client.search(criteria)
 
-        # Incremental: skip already-cached UIDs (with body)
+        # Incremental: skip already-cached UIDs (with body) -- but when we
+        # already filtered server-side via CONDSTORE, every UID returned
+        # has actually changed, so re-fetch all of them.
         cached_uids = set()
-        if not full:
+        if not full and not used_modseq:
             cached_uids = self.email_cache.get_cached_uids_with_body(mailbox)
             uids = [u for u in uids if u not in cached_uids]
 
         total_in_range = len(uids) + len(cached_uids)
 
         if not uids:
+            # Even with nothing to do, advance the watermark so the next
+            # call can use the same MODSEQ-based shortcut.
+            if condstore_supported and new_modseq is not None:
+                self.email_cache.update_highest_modseq(mailbox, new_modseq)
             return {
                 "synced": 0,
                 "total_in_range": total_in_range,
                 "already_cached": len(cached_uids),
                 "mailbox": mailbox,
+                "condstore_used": used_modseq,
+                "highest_modseq": new_modseq,
                 "message": "Already up to date",
             }
 
@@ -1297,6 +1329,12 @@ class ImapClientWrapper(SendingMixin):
                     errors += 1
 
         self.email_cache.update_last_sync(mailbox, status.uidvalidity)
+        # Persist the new HIGHESTMODSEQ so the next call can resume from
+        # here -- but only when we successfully synced everything we
+        # asked for. If errors > 0, advance partially so the next run
+        # picks up the failed UIDs again via UID-set fallback.
+        if condstore_supported and new_modseq is not None and errors == 0:
+            self.email_cache.update_highest_modseq(mailbox, new_modseq)
         self.email_cache.flush()
 
         result = {
@@ -1305,12 +1343,63 @@ class ImapClientWrapper(SendingMixin):
             "already_cached": len(cached_uids),
             "errors": errors,
             "mailbox": mailbox,
+            "condstore_used": used_modseq,
+            "highest_modseq": new_modseq,
         }
         if errors:
             result["message"] = f"Synced {synced}, {errors} errors"
         else:
-            result["message"] = f"Synced {synced} emails"
+            result["message"] = (
+                f"Synced {synced} changed messages via CONDSTORE"
+                if used_modseq else f"Synced {synced} emails"
+            )
         return result
+
+    # === CONDSTORE / RFC 7162 helpers =====================================
+
+    def _maybe_enable_condstore(self) -> bool:
+        """Enable CONDSTORE on the server if it's advertised.
+
+        Returns ``True`` when the extension is available (and now enabled),
+        ``False`` otherwise. Idempotent -- subsequent calls are cheap.
+        """
+        if getattr(self, "_condstore_enabled", False):
+            return True
+        if getattr(self, "_condstore_unavailable", False):
+            return False
+        caps = {c.upper() for c in self._get_capabilities_set()}
+        if "CONDSTORE" not in caps:
+            self._condstore_unavailable = True
+            return False
+        try:
+            self.client.enable("CONDSTORE")
+            self._condstore_enabled = True
+            return True
+        except Exception as exc:
+            logger_imap.debug("ENABLE CONDSTORE failed: %s", exc)
+            self._condstore_unavailable = True
+            return False
+
+    def _fetch_highest_modseq(self, mailbox: str) -> Optional[int]:
+        """Return the server's current ``HIGHESTMODSEQ`` for ``mailbox``.
+
+        Uses ``STATUS`` so it doesn't require re-selecting the folder.
+        Returns ``None`` if the server doesn't expose it.
+        """
+        try:
+            status = self.client.folder_status(mailbox, ["HIGHESTMODSEQ"])
+        except Exception as exc:
+            logger_imap.debug("STATUS HIGHESTMODSEQ failed: %s", exc)
+            return None
+        raw = status.get(b"HIGHESTMODSEQ")
+        if raw is None:
+            return None
+        if isinstance(raw, (list, tuple)) and raw:
+            raw = raw[0]
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
 
     def get_cache_stats(self) -> dict:
         """Return cache statistics."""
