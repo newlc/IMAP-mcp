@@ -26,7 +26,10 @@ class SieveError(Exception):
     """Raised when the ManageSieve server returns NO/BYE or the protocol fails."""
 
 
-_LITERAL_RE = re.compile(rb"\{(\d+)\+?\}\r\n")
+# Allow the trailing \r\n to be present or absent: callers usually strip the
+# line before testing it against this pattern (literal indicators arrive on
+# their own line, so the strip happens at _read_line level).
+_LITERAL_RE = re.compile(rb"\{(\d+)\+?\}(?:\r\n)?")
 
 
 class ManageSieveClient:
